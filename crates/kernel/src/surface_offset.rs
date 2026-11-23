@@ -1,0 +1,168 @@
+//! Offset surfaces (Surface › Offset): faces of a body copied out at a signed distance along
+//! their normals, as a new surface body. Each face goes onto its surface's offset, SMLib's exact
+//! offset (`smlib_offset_sheet`) of the face on its own; the offsets are then stitched where they
+//! meet within the tolerance, so neighbouring faces moved to the same place along their shared
+//! edge (meeting smoothly) keep sharing it, and across a sharp edge they come apart. Faces that
+//! close up make a solid. An offset SMLib cannot make (one that would fold a face over) is its
+//! error, never a fitted surface.
+
+use crate::body::Body;
+use crate::{KernelError, Result};
+
+/// The picked faces of `body` (indices in its face order) offset by `distance` along their
+/// outward normals (negative: against them) into one surface body. `tolerance`: how far apart
+/// two offsets' edges may be and still be one edge. A distance of zero copies the faces. The
+/// history is over `[body]`: each face is the offset of the one it came from.
+pub fn offset_surface(body: &Body, faces: &[usize], distance: f64, tolerance: f64) -> Result<Body> {
+    body.require_brep("offset")?;
+    if !(distance.is_finite() && distance.abs() < 1e6) {
+        return Err(KernelError::Invalid("the offset distance must be finite".into()));
+    }
+    if !(tolerance.is_finite() && (1e-6..=10.0).contains(&tolerance)) {
+        return Err(KernelError::Invalid("the offset tolerance must be 0.000001…10 mm".into()));
+    }
+    let count = body.face_count();
+    let mut picked: Vec<usize> = Vec::new();
+    for &i in faces {
+        if i >= count {
+            return Err(KernelError::Invalid("no such face".into()));
+        }
+        if !picked.contains(&i) {
+            picked.push(i);
+        }
+    }
+    if picked.is_empty() {
+        return Err(KernelError::Invalid("pick the faces to offset".into()));
+    }
+    crate::surfaces::offset_faces(body, &picked, distance, tolerance)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{box_solid, cylinder, measure, sphere};
+    use solidcore_record::Vec3;
+    use solidcraft_geom::prelude::*;
+
+    fn rel(a: f64, b: f64) -> f64 {
+        (a - b).abs() / b.abs().max(1e-9)
+    }
+    fn face_at(b: &Body, p: Vec3) -> usize {
+        crate::surfaces::nearest_face(b, p).unwrap()
+    }
+    fn edges(b: &Body) -> usize {
+        b.edge_count()
+    }
+
+    /// Planes move exactly: a box's top 5 up is a 10 × 10 square at z = 15. Two faces across a
+    /// sharp edge come apart (8 edges, none shared); a zero distance copies.
+    #[test]
+    fn planes_move_and_sharp_edges_come_apart() {
+        let b = box_solid(Vec3::ZERO, Vec3::new(10.0, 10.0, 10.0)).unwrap();
+        let top = face_at(&b, Vec3::new(5.0, 5.0, 10.0));
+        let up = offset_surface(&b, &[top], 5.0, 0.01).unwrap();
+        let m = measure(&up).unwrap();
+        assert!(up.is_surface() && rel(m.area, 100.0) < 1e-9 && (m.bbox.min.z - 15.0).abs() < 1e-9, "{m:?}");
+        let side = face_at(&b, Vec3::new(5.0, 0.0, 5.0));
+        let two = offset_surface(&b, &[top, side], 1.0, 0.01).unwrap();
+        assert!(two.face_count() == 2 && edges(&two) == 8);
+        let copy = offset_surface(&b, &[top, side], 0.0, 0.01).unwrap();
+        assert!(copy.face_count() == 2 && rel(measure(&copy).unwrap().area, 200.0) < 1e-9);
+    }
+
+    /// A cylinder's side (one face, closed round its seam) moved out by 2 keeps its seam joined,
+    /// with radius 12: area 2π·12·20. Moved in past its axis, refused.
+    #[test]
+    fn a_cylinder_side_changes_radius() {
+        let c = cylinder(Vec3::ZERO, Vec3::Z, 10.0, 20.0).unwrap();
+        let d = 10.0 / 2f64.sqrt();
+        let side = [face_at(&c, Vec3::new(d, d, 10.0))];
+        assert_eq!(face_at(&c, Vec3::new(-d, -d, 10.0)), side[0], "the side is one face");
+        let out = offset_surface(&c, &side, 2.0, 0.01).unwrap();
+        assert!(out.face_count() == 1);
+        let want = 2.0 * std::f64::consts::PI * 12.0 * 20.0;
+        assert!(rel(measure(&out).unwrap().area, want) < 1e-3, "{} vs {want}", measure(&out).unwrap().area); // (measured on meshes)
+        let joined = offset_surface(&c, &side, 0.0, 0.01).unwrap();
+        assert_eq!(edges(&out), edges(&joined), "the side still closes on its seam");
+        assert!(offset_surface(&c, &side, -10.5, 0.01).is_err());
+    }
+
+    /// A tube's bore moved by +1 goes into the bore (radius 17), by -1 into the wall (19); a box's bottom by +5 goes down.
+    #[test]
+    fn a_face_used_from_its_surfaces_back_moves_out_of_the_body() {
+        let outer = cylinder(Vec3::ZERO, Vec3::Z, 20.0, 20.0).unwrap();
+        let hole = cylinder(Vec3::new(0.0, 0.0, -1.0), Vec3::Z, 18.0, 22.0).unwrap();
+        let tube = crate::boolean(&outer, &hole, crate::BoolOp::Cut).unwrap().unwrap();
+        let d = 18.0 / 2f64.sqrt();
+        let bore = [face_at(&tube, Vec3::new(d, d, 10.0))];
+        for (dist, r) in [(1.0, 17.0), (-1.0, 19.0)] {
+            let m = measure(&offset_surface(&tube, &bore, dist, 0.01).unwrap()).unwrap();
+            let want = 2.0 * std::f64::consts::PI * r * 20.0;
+            assert!(rel(m.area, want) < 1e-3 && (m.bbox.max.x - r).abs() < 1e-3, "{dist}: {m:?} vs radius {r}");
+        }
+        let b = box_solid(Vec3::ZERO, Vec3::new(10.0, 10.0, 10.0)).unwrap();
+        let bottom = face_at(&b, Vec3::new(5.0, 5.0, 0.0));
+        let m = measure(&offset_surface(&b, &[bottom], 5.0, 0.01).unwrap()).unwrap();
+        assert!((m.bbox.min.z + 5.0).abs() < 1e-9 && (m.bbox.max.z + 5.0).abs() < 1e-9, "{m:?}");
+    }
+
+    /// A sphere (fitted faces) moved out by 2: area 4π·12², within the tolerance; moved in to
+    /// its centre, refused.
+    #[test]
+    fn a_sphere_is_fitted_and_refused_past_its_centre() {
+        let s = sphere(Vec3::ZERO, 10.0).unwrap();
+        let all: Vec<usize> = (0..s.face_count()).collect();
+        let out = offset_surface(&s, &all, 2.0, 0.01).unwrap();
+        let want = 4.0 * std::f64::consts::PI * 144.0;
+        assert!(rel(measure(&out).unwrap().area, want) < 2e-3, "{} vs {want}", measure(&out).unwrap().area); // (measured on meshes)
+        // The patches meet smoothly: their offsets still share every edge, and close up.
+        assert_eq!(edges(&out), edges(&s));
+        assert!(!out.is_surface(), "the offset sphere closes into a solid");
+        assert!(rel(measure(&out).unwrap().volume, 4.0 / 3.0 * std::f64::consts::PI * 1728.0) < 2e-3, "outward"); // (measured on meshes)
+        assert!(offset_surface(&s, &all, -10.0, 0.01).is_err());
+    }
+
+    /// A doubly curved patch (a saddle, a B-spline height field) moved by 1.5: every point of the
+    /// offset lies 1.5 from the patch, within the tolerance.
+    #[test]
+    fn a_bspline_patch_is_offset_within_the_tolerance() {
+        let b = box_solid(Vec3::new(-14.0, -14.0, 0.0), Vec3::new(14.0, 14.0, 20.0)).unwrap();
+        let tool = cylinder(Vec3::new(0.0, -60.0, 50.0), Vec3::Y, 40.0, 120.0).unwrap();
+        let cup = crate::boolean(&b, &tool, crate::BoolOp::Cut).unwrap().unwrap();
+        let z = |x: f64| 50.0 - (1600.0 - x * x).sqrt();
+        let rim = [Vec3::new(14.0, 0.0, z(14.0)), Vec3::new(0.0, 14.0, z(0.0)), Vec3::new(-14.0, 0.0, z(-14.0)), Vec3::new(0.0, -14.0, z(0.0))];
+        let cover = crate::patch_edges(&cup, &rim).unwrap();
+        let record = cover.record();
+        let s = solidcraft_geom::brep::eval::SurfaceEval::new(&record.faces[0].surface).unwrap();
+        let out = offset_surface(&cover, &[0], 1.5, 0.01).unwrap();
+        let mesh = out.mesh(&crate::MeshTolerance::chord(0.05)).unwrap();
+        for p in mesh.positions.iter().step_by(7) {
+            let uv = s.project(*p, None, f64::INFINITY).unwrap();
+            let dist = s.point(uv).unwrap().dist(*p);
+            assert!((dist - 1.5).abs() < 0.03, "{dist} at {p:?}");
+        }
+    }
+
+    /// A line swept round a closed 3D spline (eight fit points round a circle of radius 25, up and
+    /// down by 4 in turn) is one face, closed round the path on its seam. Offset by 1 it stays one
+    /// face closed on its seam, not a loop with a gap where the path's ends meet (#18117).
+    #[test]
+    fn a_wall_swept_round_a_closed_spline_keeps_its_seam() {
+        use crate::{PathPiece, PointPath, SweepControl};
+        use solidcore_record::{Plane, Seg2, Vec2};
+        let fit: Vec<Vec3> = (0..=8)
+            .map(|i| {
+                let t = std::f64::consts::TAU * (i % 8) as f64 / 8.0;
+                Vec3::new(25.0 * t.cos(), 25.0 * t.sin(), if i % 2 == 0 { 10.0 } else { 6.0 })
+            })
+            .collect();
+        let path = PointPath { pieces: vec![PathPiece::Spline { fit, reversed: false }] };
+        let plane = Plane { origin: Vec3::new(0.0, 0.0, 10.0), x: Vec3::X, y: Vec3::Y };
+        let line = vec![Seg2::Line { a: Vec2::new(25.0, 0.0), b: Vec2::new(31.0, 0.0) }];
+        let wall = crate::surfaces::sweep_sheet_point_path_with(&plane, &[line], &path, &SweepControl::default()).unwrap();
+        assert!(wall.face_count() == 1 && edges(&wall) == 3, "{} faces, {} edges", wall.face_count(), edges(&wall));
+        let out = offset_surface(&wall, &[0], 1.0, 0.01).unwrap();
+        assert!(out.is_surface() && out.face_count() == 1, "{} faces", out.face_count());
+        assert_eq!(edges(&out), 3, "the offset closes on its seam");
+    }
+}

@@ -1,0 +1,8589 @@
+use solidcraft_geom::MeshGeom;
+use std::f64::consts::PI;
+
+use serde_json::{Value, json};
+
+use crate::*;
+
+/// A folder of the test's own, removed when dropped.
+pub(crate) struct Folder(pub std::path::PathBuf);
+
+impl Folder {
+    pub(crate) fn new(name: &str) -> Folder {
+        let dir = solidcraft_io::vfs::temp_dir().join(format!("solidcraft-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        Folder(dir)
+    }
+    pub(crate) fn path(&self, file: &str) -> String {
+        self.0.join(file).to_str().unwrap().to_string()
+    }
+}
+
+impl Drop for Folder {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+pub(crate) mod mesh_convert;
+
+/// Writes `bytes` to an image file of its own for a test and returns its path: an image is given
+/// to `canvas.insert` and `canvas.decal` as a file, never as text.
+pub(crate) fn image_file(bytes: &[u8]) -> String {
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let dir = solidcraft_io::vfs::temp_dir().join(format!("solidcraft-test-images-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(format!("{}.img", NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
+    std::fs::write(&path, bytes).unwrap();
+    path.to_string_lossy().into_owned()
+}
+
+/// Counts the copies `Session::doc_mut` makes of a shared document.
+pub(crate) mod doc_copies {
+    use std::cell::Cell;
+
+    thread_local! {
+        static COUNT: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub fn record() {
+        COUNT.with(|c| c.set(c.get() + 1));
+    }
+
+    /// The count since the last call.
+    pub fn take() -> usize {
+        COUNT.with(|c| c.replace(0))
+    }
+}
+
+/// A PNG's width and height (its IHDR).
+pub(crate) fn png_size(png: &[u8]) -> (u32, u32) {
+    let be = |i: usize| u32::from_be_bytes([png[i], png[i + 1], png[i + 2], png[i + 3]]);
+    (be(16), be(20))
+}
+
+fn run(s: &mut Session, id: &str, p: Value) -> Value {
+    match s.execute(id, &p) {
+        Ok(v) => v,
+        Err(e) => panic!("{id} {p}: {e}"),
+    }
+}
+
+fn volume(s: &mut Session) -> f64 {
+    let m = run(s, "inspect.measure", json!({}));
+    m["total"]["volume_mm3"].as_f64().unwrap()
+}
+
+fn rel(a: f64, b: f64) -> f64 {
+    (a - b).abs() / b.abs().max(1e-12)
+}
+
+#[test]
+fn round_as_tall_as_a_disc_uses_up_its_wall() {
+    // #190: a disc 13 in radius and 2 high, its top edge rounded by 2.
+    let mut s = Session::default();
+    run(&mut s, "solid.cylinder", json!({"radius": 13, "height": 2}));
+    run(&mut s, "solid.fillet", json!({"edges": [[0, 13, 2], [0, -13, 2]], "radius": "2 mm"}));
+    let (a, c) = ((1.0 - PI / 4.0) * 4.0, 2.0 * (10.0 - 3.0 * PI) / (3.0 * (4.0 - PI)));
+    let expect = PI * 169.0 * 2.0 - a * 2.0 * PI * (13.0 - c);
+    assert!(rel(volume(&mut s), expect) < 2e-4, "{} vs {expect}", volume(&mut s));
+}
+
+/// #783: an edge pick far from every edge (beside the body, above it, inside it, or on another
+/// body than the one named) is refused and adds nothing, instead of rounding the nearest edge;
+/// a pick on an edge, or a little off it as a click lands, still works.
+#[test]
+fn edge_picks_far_from_every_edge_are_refused() {
+    let mut s = Session::default();
+    for (name, x) in [("A", 0), ("B", 40), ("C", 80), ("D", 120)] {
+        run(&mut s, "solid.box", json!({"length": 20, "width": 20, "height": 10, "corner": [x, 0, 0], "operation": "new", "body_name": name}));
+    }
+    run(&mut s, "solid.fillet", json!({"body": "A", "edges": [[10, 0, 10]], "radius": 1}));
+    run(&mut s, "solid.fillet", json!({"body": "B", "edges": [[50, 0.4, 10.3]], "radius": 1}));
+    let features = s.doc.features.len();
+    for (id, p, far) in [
+        ("solid.fillet", json!({"body": "B", "edges": [[50, -15, 10]], "radius": 1}), "15.0"),
+        ("solid.chamfer", json!({"body": "C", "edges": [[90, 10, 40]], "distance": 1}), "31.623 mm"),
+        ("solid.fillet", json!({"edges": [[130, 10, 5]], "radius": 1}), "11.180 mm"),
+        ("solid.fillet", json!({"body": "C", "edges": [[10, 20, 10]], "radius": 1}), "mm away"),
+        ("solid.press_pull", json!({"edges": [[50, -15, 10]], "distance": 1}), "15.0"),
+    ] {
+        let err = s.execute(id, &p).expect_err(&format!("{id} {p}")).to_string();
+        assert!(err.contains("no edge at") && err.contains(far), "{id} {p}: {err}");
+    }
+    assert_eq!(s.doc.features.len(), features);
+}
+
+#[test]
+fn edge_picks_at_a_corner_are_refused() {
+    for (id, size) in [("solid.chamfer", "distance"), ("solid.fillet", "radius")] {
+        let mut s = Session::default();
+        run(&mut s, "solid.box", json!({"length": 20, "width": 20, "height": 20}));
+        let features = s.doc.features.len();
+        for edge in [json!([20, 20, 20]), json!({"point": [20, 20, 20]})] {
+            let err = s.execute(id, &json!({"edges": [edge], size: 2})).unwrap_err().to_string();
+            assert!(err.contains("[20, 20, 20]") && err.contains("3 edges") && err.contains("midpoint"), "{id}: {err}");
+            assert_eq!(s.doc.features.len(), features);
+            assert!((volume(&mut s) - 8000.0).abs() < 1e-6);
+        }
+        // 1 mm from the corner along one edge: near the other two, but on just that one.
+        run(&mut s, id, json!({"edges": [[19, 20, 20]], size: 2}));
+        assert_eq!(s.doc.features.len(), features + 1);
+        let removed = if id == "solid.chamfer" { 40.0 } else { (4.0 - PI) * 20.0 };
+        assert!(rel(volume(&mut s), 8000.0 - removed) < 2e-4);
+    }
+}
+
+/// Edge picks on bodies apart: one pick keeps its body on the feature (the model has two), and
+/// picks on both keep none, each found where it lies.
+#[test]
+fn edge_picks_on_bodies_apart_keep_the_body_they_lie_on() {
+    let boxes = || {
+        let mut s = Session::default();
+        run(&mut s, "solid.box", json!({"length": 40, "width": 30, "height": 10, "body_name": "Low"}));
+        run(&mut s, "solid.box", json!({"length": 40, "width": 30, "height": 10, "corner": [0, 0, 50], "operation": "new", "body_name": "High"}));
+        s
+    };
+    let kept = |s: &Session| match &s.doc.features.last().unwrap().kind {
+        solidcraft_doc::FeatureKind::Chamfer { body, .. } => body.as_ref().map(|b| b.0.clone()),
+        k => panic!("{k:?}"),
+    };
+    let each = |s: &Session| ["Low", "High"].map(|b| s.model.state().body(b).unwrap().measure().unwrap().volume);
+    let mut s = boxes();
+    run(&mut s, "solid.chamfer", json!({"edges": [[20, 0, 0]], "distance": 1}));
+    assert_eq!(kept(&s).as_deref(), Some("Low"));
+    let [low, high] = each(&s);
+    assert!((low - 11980.0).abs() < 0.02 && high == 12000.0, "{low} {high}");
+    let mut s = boxes();
+    run(&mut s, "solid.chamfer", json!({"edges": [[20, 0, 0], [20, 0, 60]], "distance": 1}));
+    assert_eq!(kept(&s), None);
+    let [low, high] = each(&s);
+    assert!((low - 11980.0).abs() < 0.02 && (high - 11980.0).abs() < 0.02, "{low} {high}");
+}
+
+/// The halves of a split box share the edges along the cut: a pick on one is refused naming both
+/// halves, and `body` cuts the half named.
+#[test]
+fn edge_picks_on_the_cut_of_a_split_body_name_both_halves() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 40, "width": 30, "height": 10, "body_name": "Box"}));
+    run(&mut s, "solid.split_body", json!({"body": "Box", "plane": {"origin": [20, 0, 0], "normal": [1, 0, 0]}}));
+    let features = s.doc.features.len();
+    let err = s.execute("solid.chamfer", &json!({"edges": [[20, 15, 10]], "distance": 1})).unwrap_err().to_string();
+    assert!(err.contains("[20, 15, 10] lies on edges of 2 bodies, Box and Box (1)") && err.contains("with `body`"), "{err}");
+    assert_eq!(s.doc.features.len(), features);
+    run(&mut s, "solid.chamfer", json!({"edges": [[20, 15, 10]], "distance": 1, "body": "Box (1)"}));
+    let half = |s: &Session, b: &str| s.model.state().body(b).unwrap().measure().unwrap().volume;
+    assert!((half(&s, "Box (1)") - 5985.0).abs() < 0.02 && (half(&s, "Box") - 6000.0).abs() < 1e-6, "{} {}", half(&s, "Box"), half(&s, "Box (1)"));
+}
+
+/// A box touching a cylinder along the cylinder's seam: the seam is not an edge to blend, so the
+/// box's edge there is cut.
+#[test]
+fn an_edge_along_another_bodys_seam_is_picked() {
+    let mut s = Session::default();
+    run(&mut s, "solid.cylinder", json!({"radius": 10, "height": 10, "body_name": "Rod"}));
+    let rod = s.model.state().body("Rod").unwrap().body.clone();
+    let mesh = rod.mesh(&solidcraft_kernel::MeshTolerance::chord(0.06)).unwrap();
+    let seam = mesh.edges.iter().zip(&mesh.seams).find(|(_, seam)| **seam).unwrap().0[0];
+    // The box's quarter past the seam's line is outside the cylinder: they touch along it.
+    run(
+        &mut s,
+        "solid.box",
+        json!({"length": 20, "width": 20, "height": 10, "corner": [seam.x, seam.y, 0], "operation": "new", "body_name": "Block"}),
+    );
+    run(&mut s, "solid.chamfer", json!({"edges": [[seam.x, seam.y, 5]], "distance": 1}));
+    let kept = match &s.doc.features.last().unwrap().kind {
+        solidcraft_doc::FeatureKind::Chamfer { body, .. } => body.as_ref().map(|b| b.0.clone()),
+        k => panic!("{k:?}"),
+    };
+    assert_eq!(kept.as_deref(), Some("Block"));
+    let v = |b: &str| s.model.state().body(b).unwrap().measure().unwrap().volume;
+    assert!((v("Block") - 3995.0).abs() < 0.02 && (v("Rod") - PI * 1000.0).abs() < 1.0, "{} {}", v("Block"), v("Rod"));
+}
+
+#[test]
+fn fillet_as_wide_as_a_face_rounds_it_off() {
+    // #199: 14 x 6 x 10 box, the four vertical edges at r = 3 (half the 6 mm end faces).
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 14, "width": 6, "height": 10, "corner": [14, 0, 0]}));
+    run(&mut s, "solid.fillet", json!({"edges": [[14, 0, 5], [28, 0, 5], [14, 6, 5], [28, 6, 5]], "radius": "3"}));
+    let expect = 840.0 - (4.0 - PI) * 9.0 * 10.0;
+    assert!(rel(volume(&mut s), expect) < 2e-4, "{} vs {expect}", volume(&mut s));
+    assert!(s.execute("solid.fillet", &json!({"edges": [[21, 0, 10]], "radius": 3.5})).is_err());
+}
+
+/// The owner's ruling of 2026-10-30: two edges of a 20 mm box rounded r2 in one fillet (they
+/// meet in a mitre at the corner (20, 0, 20), the upright edge there sharp), then the upright edge
+/// r3 in a second fillet, whose tangent chain takes the mitre's seam with it. The corner is
+/// solidcore's setback corner for three rounds of different radii there (solidcore#2382): 15
+/// faces, 7927.724282512234 mm³. The r2 rounds keep their names, and the r3 round and the
+/// corner's six patches are the second fillet's.
+#[test]
+fn a_later_round_at_a_mitred_corner_is_blended_with_the_rounds_there() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 20, "width": 20, "height": 20, "body_name": "Box"}));
+    let first = run(&mut s, "solid.fillet", json!({"edges": [[20, 10, 20], [10, 0, 20]], "radius": 2}))["feature"].as_u64().unwrap();
+    // A point halfway along each r2 round, at 45° between its faces.
+    let k = 2.0 - 2.0_f64.sqrt();
+    let rounds = [solidcore_record::Vec3::new(20.0 - k, 10.0, 20.0 - k), solidcore_record::Vec3::new(10.0, k, 20.0 - k)];
+    let named = |s: &mut Session, at: solidcore_record::Vec3| {
+        let st = s.model.state();
+        let (d, index) = solidcraft_doc::appearance::nearest_face(st.body("Box").unwrap(), at).unwrap();
+        // Found on the display mesh, whose facets lie within its chord of the faces.
+        assert!(d < 0.05, "{at:?} is {d} off the nearest face");
+        let faces = run(s, "model.faces", json!({"body": "Box"}))["faces"].as_array().cloned().unwrap_or_default();
+        faces.iter().find(|f| f["index"].as_u64() == Some(index as u64)).and_then(|f| f["name"].as_str()).unwrap_or_default().to_string()
+    };
+    let before: Vec<String> = rounds.iter().map(|p| named(&mut s, *p)).collect();
+    assert!(before.iter().all(|n| n.starts_with(&format!("F{first}:blend("))), "{before:?}");
+    let second = run(&mut s, "solid.fillet", json!({"edges": [[20, 0, 10]], "radius": 3}))["feature"].as_u64().unwrap();
+    assert!(s.model.results.iter().all(|r| r.error.is_none()), "{:?}", s.model.results);
+    let v = volume(&mut s);
+    assert!((v - 7927.724282512234).abs() < 1e-6, "{v}");
+    let faces = run(&mut s, "model.faces", json!({"body": "Box"}))["faces"].as_array().cloned().unwrap_or_default();
+    assert_eq!(faces.len(), 15);
+    let after: Vec<String> = rounds.iter().map(|p| named(&mut s, *p)).collect();
+    assert_eq!(after, before);
+    // The r3 round (halfway up, at 45°) and the corner's patches: the faces the second fillet made.
+    let k3 = 3.0 - 4.5_f64.sqrt();
+    assert!(named(&mut s, solidcore_record::Vec3::new(20.0 - k3, k3, 10.0)).starts_with(&format!("F{second}:blend(")));
+    let made = faces.iter().filter(|f| f["name"].as_str().is_some_and(|n| n.starts_with(&format!("F{second}:")))).count();
+    // the r3 round and the corner's six patches
+    assert_eq!(made, 7, "{faces:?}");
+}
+
+#[test]
+fn join_extrude_from_a_chamfered_top_face() {
+    let mut s = Session::default();
+    run(&mut s, "parameters.add", json!({"name":"height","expression":"20 mm"}));
+    run(&mut s, "parameters.add", json!({"name":"bevel","expression":"2 mm"}));
+    run(&mut s, "sketch.create", json!({"plane": "XY"}));
+    run(&mut s, "sketch.circle.center", json!({"center": [0, 0], "radius": 10}));
+    let source = run(&mut s, "solid.extrude", json!({"distance": "height","name":"Stem"}))["feature"].as_u64().unwrap();
+    run(&mut s, "solid.chamfer", json!({"edges": [[10, 0, 20]], "distance": "bevel"}));
+    let base = volume(&mut s);
+    let id = run(&mut s, "sketch.create", json!({"plane": {"face": [0, 0, 20]}}))["sketch"].as_u64().unwrap();
+    let solidcraft_doc::FeatureKind::Sketch { plane: solidcraft_doc::PlaneRef::Face { anchor: Some(anchor), .. }, sketch } =
+        &s.doc.feature(id).unwrap().kind
+    else {
+        panic!("the chamfered cap retains its exact original construction support");
+    };
+    assert_eq!(anchor.target.origin_feature, source);
+    assert!(matches!(anchor.target.certificate, Some(solidcraft_doc::config::FaceCertificate::ExtrudeCap { high: true, .. })));
+    assert!(!sketch.links.is_empty());
+    assert!(sketch.links.iter().all(|link| link.auto_face && !link.lost));
+    // The default linked cap outline is radius8; no explicit fixed plane or
+    // duplicate manually drawn circle is required to join a pad to that face.
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "solid.extrude", json!({"distance": 5, "operation": "join"}));
+    assert_eq!(s.model.state().bodies.len(), 1);
+    assert!(rel(volume(&mut s), base + PI * 64.0 * 5.0) < 5e-4);
+    for (height, bevel) in [(20., 2.), (25., 3.)] {
+        run(&mut s, "parameters.change", json!({"name":"height","expression":format!("{height} mm")}));
+        run(&mut s, "parameters.change", json!({"name":"bevel","expression":format!("{bevel} mm")}));
+        let expected = PI * (100. * height - (10. * bevel * bevel - bevel * bevel * bevel / 3.) + (10. - bevel) * (10. - bevel) * 5.);
+        let loaded = solidcraft_doc::Document::from_json(&s.doc.to_json()).unwrap();
+        let mut cold = Session::new(loaded);
+        let warm_volume = volume(&mut s);
+        let cold_volume = volume(&mut cold);
+        assert!(rel(warm_volume, expected) < 5e-4, "{warm_volume} vs {expected}");
+        assert!((warm_volume - cold_volume).abs() < 1e-8);
+        for current in [&s, &cold] {
+            assert!(current.model.results.iter().all(|result| result.error.is_none() && result.warning.is_none()), "{:?}", current.model.results);
+            let state = current.model.state();
+            assert_eq!(state.bodies.len(), 1);
+            let solved = state.sketch(id).unwrap();
+            assert!((solved.plane.origin.z - height).abs() < 1e-8);
+            assert!(solved.sketch.links.iter().all(|link| link.auto_face && !link.lost));
+            let body = &state.bodies[0];
+            assert_eq!(body.body.classify_point(solidcore_record::Vec3::new(0., 0., height + 4.)).unwrap(), solidcraft_kernel::PointClass::Inside);
+            assert_eq!(body.body.classify_point(solidcore_record::Vec3::new(0., 0., height + 6.)).unwrap(), solidcraft_kernel::PointClass::Outside);
+            assert_eq!(
+                body.body.classify_point(solidcore_record::Vec3::new(10. - bevel - 0.5, 0., height + 4.)).unwrap(),
+                solidcraft_kernel::PointClass::Inside
+            );
+            assert_eq!(
+                body.body.classify_point(solidcore_record::Vec3::new(10. - bevel + 0.5, 0., height + 4.)).unwrap(),
+                solidcraft_kernel::PointClass::Outside
+            );
+        }
+    }
+}
+
+#[test]
+fn a_body_cut_in_pieces_twice_gets_pieces_of_their_own_names() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 40, "width": 5, "height": 5, "body_name": "Bar"}));
+    for x in [10, 25] {
+        run(&mut s, "solid.box", json!({"corner": [x, -1, -1], "length": 2, "width": 7, "height": 7, "body_name": "Gap"}));
+        run(&mut s, "solid.combine", json!({"target": "Bar", "tools": ["Gap"], "operation": "cut"}));
+    }
+    let names: Vec<String> = s.model.state().bodies.iter().map(|b| b.name.clone()).collect();
+    let unique: std::collections::BTreeSet<&String> = names.iter().collect();
+    assert_eq!(unique.len(), 3, "{names:?}");
+    assert!(names.contains(&"Bar (2)".to_string()), "{names:?}");
+}
+
+/// The pieces a cut leaves of a body are made of what the body was: each takes its physical
+/// material and appearance. Before, a piece past the first came out with neither.
+#[test]
+fn pieces_cut_off_a_body_keep_its_material_and_appearance() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 40, "width": 5, "height": 5, "body_name": "Bar"}));
+    run(&mut s, "material.assign", json!({"bodies": ["Bar"], "material": "Steel"}));
+    run(&mut s, "appearance.assign", json!({"bodies": ["Bar"], "color": "#d01c1c"}));
+    run(&mut s, "solid.box", json!({"corner": [19, -1, -1], "length": 2, "width": 7, "height": 7, "body_name": "Gap"}));
+    let r = run(&mut s, "solid.combine", json!({"target": "Bar", "tools": ["Gap"], "operation": "cut"}));
+    let pieces: Vec<String> = s.model.state().bodies.iter().map(|b| b.name.clone()).collect();
+    assert_eq!(pieces.len(), 2, "{pieces:?} {r}");
+    let look = s.doc.appearances.bodies.get("Bar").cloned();
+    assert!(look.is_some());
+    for piece in &pieces {
+        assert_eq!(s.doc.materials.get(piece).map(String::as_str), Some("Steel"), "{piece}");
+        assert_eq!(s.doc.appearances.bodies.get(piece), look.as_ref(), "{piece}");
+    }
+    // Undone, the cut takes the pieces' material and look with it.
+    run(&mut s, "edit.undo", json!({}));
+    assert!(pieces.iter().filter(|p| *p != "Bar").all(|p| !s.doc.materials.contains_key(p) && !s.doc.appearances.bodies.contains_key(p)));
+}
+
+/// A join that bridges two bodies makes them one body, not an overlap of the first and the second.
+#[test]
+fn extrude_a_face_where_another_body_lies_flush_on_it() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 20, "width": 20, "height": 4, "body_name": "A"}));
+    run(&mut s, "solid.box", json!({"corner": [10, 0, 4], "length": 10, "width": 20, "height": 1, "body_name": "B"}));
+    // A's top and B's bottom both lie at the point: which one is meant has to be said.
+    let e = s.execute("solid.extrude", &json!({"face": [15, 5, 4], "distance": "2 mm", "operation": "new"})).unwrap_err().to_string();
+    assert!(e.contains("A") && e.contains("B") && e.contains("face_body"), "{e}");
+    let r = run(&mut s, "solid.extrude", json!({"face": [15, 5, 4], "face_body": "A", "distance": "2 mm", "operation": "new", "body_name": "C"}));
+    let m = run(&mut s, "inspect.measure", json!({"bodies": ["C"]}));
+    let v = m["total"]["volume_mm3"].as_f64().unwrap();
+    assert!((v - 20.0 * 20.0 * 2.0).abs() < 1e-6, "{v} {r}");
+    let e = s.execute("solid.extrude", &json!({"face": [15, 5, 4], "face_body": "Nope", "distance": "2 mm"})).unwrap_err().to_string();
+    assert!(e.contains("Nope"), "{e}");
+}
+
+#[test]
+fn join_bridging_two_bodies_merges_them() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 10, "width": 10, "height": 10}));
+    run(&mut s, "solid.box", json!({"length": 10, "width": 10, "height": 10, "corner": [20, 0, 0], "operation": "new_body"}));
+    run(&mut s, "solid.box", json!({"length": 20, "width": 4, "height": 4, "corner": [5, 3, 3], "operation": "join"}));
+    let st = s.model.state();
+    assert_eq!(st.bodies.len(), 1, "both boxes and the bar are one body");
+    assert_eq!(st.bodies[0].name, "Body1");
+    assert_eq!(st.bodies[0].body.lumps().unwrap().len(), 1);
+    // 2 boxes + the bar's 10 mm outside them.
+    assert!(rel(volume(&mut s), 2000.0 + 10.0 * 16.0) < 1e-6);
+}
+
+/// A join touching only the second body merges into that body and leaves the first alone.
+#[test]
+fn join_merges_into_the_body_it_meets() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 10, "width": 10, "height": 10}));
+    run(&mut s, "solid.box", json!({"length": 10, "width": 10, "height": 10, "corner": [20, 0, 0], "operation": "new_body"}));
+    // Sits on Body2's top face: a face contact, no shared volume.
+    run(&mut s, "solid.box", json!({"length": 4, "width": 4, "height": 4, "corner": [23, 3, 10], "operation": "join"}));
+    let st = s.model.state();
+    assert_eq!(st.bodies.len(), 2);
+    let b1 = st.bodies.iter().find(|b| b.name == "Body1").unwrap();
+    let b2 = st.bodies.iter().find(|b| b.name == "Body2").unwrap();
+    assert_eq!(b1.body.face_count(), 6, "Body1 is untouched");
+    assert_eq!(b2.body.lumps().unwrap().len(), 1);
+    assert!(rel(volume(&mut s), 2064.0) < 1e-6);
+}
+
+/// A join that meets no body still joins the first body, as a separate lump, and says nothing:
+/// pieces that touch nothing stay one body.
+#[test]
+fn join_meeting_nothing_keeps_the_first_body() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 10, "width": 10, "height": 10}));
+    let r = run(&mut s, "solid.box", json!({"length": 4, "width": 4, "height": 4, "corner": [40, 0, 0], "operation": "join"}));
+    assert!(r.get("notice").is_none(), "{r}");
+    let st = s.model.state();
+    assert_eq!(st.bodies.len(), 1);
+    assert_eq!(st.bodies[0].body.lumps().unwrap().len(), 2);
+    assert!(rel(volume(&mut s), 1064.0) < 1e-6);
+}
+
+/// A join of a box touching the first only along an edge keeps it a body of its own and says
+/// so, with the edit that makes them one body.
+#[test]
+fn join_touching_along_an_edge_keeps_a_separate_body() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 10, "width": 10, "height": 10}));
+    let r = run(&mut s, "solid.box", json!({"length": 10, "width": 10, "height": 10, "corner": [10, 10, 0], "operation": "join"}));
+    assert_eq!(r["notice"]["contact"], "along_edge", "{r}");
+    assert_eq!(r["notice"]["message"], "These bodies only touch along an edge, so they were kept as separate bodies.", "{r}");
+    assert_eq!(r["notice"]["action"]["params"]["set"], json!({"touching": "one_body"}), "{r}");
+    assert_eq!(s.model.state().bodies.len(), 2);
+}
+
+/// A 1 mm floor extruded into a through hole, from the sketch the plate was extruded from: the
+/// disc's wall lies on the hole's and its foot in the plate's bottom face. A wedge extruded
+/// sideways on top keeps the plate from being a prism along Z (the 2D route would take it
+/// otherwise), and the join failed with "boolean Union: the operation failed: no result".
+#[test]
+fn join_a_floor_into_a_through_hole() {
+    let mut s = Session::default();
+    run(&mut s, "sketch.create", json!({"plane": "XY", "name": "Plate"}));
+    run(&mut s, "sketch.rectangle.two_point", json!({"p0": [0, 0], "p1": [100, 60]}));
+    run(&mut s, "sketch.circle.center", json!({"center": [60, 30], "radius": 20}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "solid.extrude", json!({"sketch": "Plate", "profiles": [{"point": [5, 5]}], "distance": 10}));
+    run(&mut s, "sketch.create", json!({"plane": "XZ", "name": "Wedge"}));
+    run(&mut s, "sketch.line", json!({"points": [[5, -10], [25, -10], [5, -16]], "closed": true}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "solid.extrude", json!({"sketch": "Wedge", "distance": 40, "operation": "join"}));
+    let before = volume(&mut s);
+    run(&mut s, "solid.extrude", json!({"sketch": "Plate", "profiles": [{"point": [60, 30]}], "distance": 1, "operation": "join"}));
+    let st = s.model.state();
+    assert_eq!(st.bodies.len(), 1);
+    assert_eq!(st.bodies[0].body.lumps().unwrap().len(), 1);
+    assert!(st.bodies[0].body.validity().is_empty(), "{:?}", st.bodies[0].body.validity());
+    // Exact: the disc isn't moved to get the bodies to intersect, so the feature has no warning.
+    let warning = s.model.results.last().and_then(|r| r.warning.clone());
+    assert!(warning.is_none(), "{warning:?}");
+    let added = volume(&mut s) - before;
+    assert!(rel(added, PI * 400.0) < 1e-3, "{added}");
+}
+
+/// Two spheres of one size: the join's contact test tried every pair of their finely meshed
+/// triangles and refused the join as too much work (#232).
+#[test]
+fn join_of_two_overlapping_equal_spheres_is_not_refused() {
+    let mut s = Session::default();
+    run(&mut s, "solid.sphere", json!({"radius": 10, "center": [0, 0, 0], "body_name": "A"}));
+    run(&mut s, "solid.sphere", json!({"radius": 10, "center": [12, 0, 0], "body_name": "B"}));
+    run(&mut s, "solid.combine", json!({"target": "A", "tools": ["B"], "operation": "join"}));
+    assert_eq!(s.model.state().bodies.len(), 1);
+    // Two spheres less the lens they share: 2 * 4/3 pi r^3 - pi (4r + d) (2r - d)^2 / 12.
+    let (r, d) = (10.0, 12.0);
+    let want = 2.0 * 4.0 / 3.0 * PI * r * r * r - PI * (4.0 * r + d) * (2.0 * r - d) * (2.0 * r - d) / 12.0;
+    let got = volume(&mut s);
+    assert!(rel(got, want) < 1e-3, "{got} vs {want}");
+}
+
+/// Area two discs of radii `r1`, `r2` with centres `d` apart have in common.
+fn disc_overlap(r1: f64, r2: f64, d: f64) -> f64 {
+    if d >= r1 + r2 {
+        return 0.0;
+    }
+    if d <= (r1 - r2).abs() {
+        return PI * r1.min(r2) * r1.min(r2);
+    }
+    let a = ((d * d + r1 * r1 - r2 * r2) / (2.0 * d * r1)).acos();
+    let b = ((d * d + r2 * r2 - r1 * r1) / (2.0 * d * r2)).acos();
+    r1 * r1 * a + r2 * r2 * b - 0.5 * ((-d + r1 + r2) * (d + r1 - r2) * (d - r1 + r2) * (d + r1 + r2)).sqrt()
+}
+
+/// Two thick rings 11 mm apart: their walls cross, and the join was refused as too much work (#232).
+#[test]
+fn join_of_two_overlapping_rings_is_not_refused() {
+    let mut s = Session::default();
+    for (name, x) in [("RingA", 0.0), ("RingB", 11.0)] {
+        run(
+            &mut s,
+            "solid.cylinder",
+            json!({"diameter": 120, "height": 60, "base": [x, 0, 0], "operation": "new", "name": format!("{name}Outer"), "body_name": name}),
+        );
+        run(
+            &mut s,
+            "solid.cylinder",
+            json!({"diameter": 96, "height": 60, "base": [x, 0, 0], "operation": "cut", "targets": [name], "name": format!("{name}Bore")}),
+        );
+    }
+    run(&mut s, "solid.combine", json!({"target": "RingA", "tools": ["RingB"], "operation": "join"}));
+    assert_eq!(s.model.state().bodies.len(), 1);
+    // Union of the two rings' plan areas: both less what they share, which is the overlap of the
+    // two outer discs less the two bores (each inside the other's outer disc) plus the bores' own overlap.
+    let (outer, bore, d) = (60.0, 48.0, 11.0);
+    let ring = PI * (outer * outer - bore * bore);
+    let shared = disc_overlap(outer, outer, d) - 2.0 * disc_overlap(bore, outer, d) + disc_overlap(bore, bore, d);
+    let want = (2.0 * ring - shared) * 60.0;
+    let got = volume(&mut s);
+    assert!(rel(got, want) < 1e-3, "{got} vs {want}");
+}
+
+/// A disc with a lobe on its rim, patterned six times about its centre: every copy shares the
+/// whole disc with the target, and joining them was refused as too much contact work (#1029).
+#[test]
+fn join_of_a_lobed_disc_pattern_is_not_refused() {
+    let mut s = Session::default();
+    run(&mut s, "sketch.create", json!({"plane": "XY"}));
+    run(&mut s, "sketch.circle.center", json!({"center": [0, 0], "diameter": 15}));
+    run(&mut s, "sketch.circle.center", json!({"center": [0, 7.5], "diameter": 5}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "solid.extrude", json!({"distance": 10, "profiles": "all", "operation": "new", "body_name": "Disc"}));
+    run(&mut s, "solid.pattern.circular", json!({"bodies": ["Disc"], "axis": "Z", "count": 6}));
+    let tools: Vec<String> = s.model.state().bodies.iter().map(|b| b.name.clone()).filter(|n| n != "Disc").collect();
+    assert_eq!(tools.len(), 5);
+    run(&mut s, "solid.combine", json!({"target": "Disc", "tools": tools, "operation": "join"}));
+    assert_eq!(s.model.state().bodies.len(), 1);
+    // The disc plus six lobes, each less the part inside the disc; neighbouring lobes stay apart.
+    let (disc, lobe) = (7.5, 2.5);
+    let want = (PI * disc * disc + 6.0 * (PI * lobe * lobe - disc_overlap(disc, lobe, disc))) * 10.0;
+    let got = volume(&mut s);
+    assert!(rel(got, want) < 1e-3, "{got} vs {want}");
+}
+
+mod barrel_join;
+mod blend_fit;
+mod component_frames;
+mod curved_seam_round;
+mod flush_join_loft;
+mod gltf_import;
+mod import_component;
+mod kernel_pool;
+mod kicad_import;
+mod large_step_import;
+mod loft_ring;
+mod loft_spacing;
+mod mirror_placed;
+mod mirror_planes;
+#[cfg(not(target_arch = "wasm32"))]
+mod native_cad_import;
+mod nudge_slivers;
+#[cfg(not(target_arch = "wasm32"))]
+mod openusd;
+mod path_scope;
+mod pleat_join;
+mod primitive_points;
+mod rim_cut;
+mod robustness;
+mod rounded_loft_face;
+mod sphere_lens;
+mod spiral_join;
+mod step_import_options;
+mod xz_plane;
+
+/// Plan area a round of radius `r` fills at the concave corner `x` where circles (c1, r1) and
+/// (c2, r2) cross: the triangle of its contacts and the corner, less the three circular segments.
+fn round_gap(c1: [f64; 2], r1: f64, c2: [f64; 2], r2: f64, x: [f64; 2], r: f64) -> f64 {
+    let (a, b) = (r1 + r, r2 + r);
+    let d = (c2[0] - c1[0]).hypot(c2[1] - c1[1]);
+    let u = [(c2[0] - c1[0]) / d, (c2[1] - c1[1]) / d];
+    let along = (a * a - b * b + d * d) / (2.0 * d);
+    let side = if (x[0] - c1[0]) * -u[1] + (x[1] - c1[1]) * u[0] < 0.0 { -1.0 } else { 1.0 };
+    let off = (a * a - along * along).sqrt() * side;
+    let f = [c1[0] + u[0] * along - u[1] * off, c1[1] + u[1] * along + u[0] * off];
+    let t1 = [c1[0] + (f[0] - c1[0]) * r1 / a, c1[1] + (f[1] - c1[1]) * r1 / a];
+    let t2 = [c2[0] + (f[0] - c2[0]) * r2 / b, c2[1] + (f[1] - c2[1]) * r2 / b];
+    let angle = |c: [f64; 2], p: [f64; 2], q: [f64; 2]| {
+        let (v, w) = ([p[0] - c[0], p[1] - c[1]], [q[0] - c[0], q[1] - c[1]]);
+        ((v[0] * w[0] + v[1] * w[1]) / (v[0].hypot(v[1]) * w[0].hypot(w[1]))).clamp(-1.0, 1.0).acos()
+    };
+    let segment = |r: f64, t: f64| r * r * (t - t.sin()) / 2.0;
+    let triangle = ((x[0] - t1[0]) * (t2[1] - t1[1]) - (t2[0] - t1[0]) * (x[1] - t1[1])).abs() / 2.0;
+    triangle - segment(r1, angle(c1, t1, x)) - segment(r2, angle(c2, x, t2)) - segment(r, angle(f, t2, t1))
+}
+
+/// A profile of two overlapping arcs, extruded: the vertical edges where the two walls meet are
+/// straight lines between cylinders, and their rounds end on the caps across curved edges.
+#[test]
+fn fillet_the_edges_between_two_overlapping_cylinders() {
+    let (c1, r1) = ([0.0, 0.0], 17.140595088852663);
+    let (c2, r2) = ([10.715766135516247, 13.378055020402751], 9.666944358807896);
+    let (p, q) = ([1.7728134670876865, 17.048669520256194], [16.250324167975673, 5.452243981674495]);
+    let profile = 1087.5018766864137;
+    let mut s = Session::default();
+    run(&mut s, "sketch.create", json!({"plane": "XY"}));
+    run(&mut s, "sketch.arc.center_point", json!({"center": c1, "start": p, "end": q}));
+    run(&mut s, "sketch.arc.center_point", json!({"center": c2, "start": q, "end": p}));
+    let si = run(&mut s, "sketch.inspect", json!({}));
+    assert!(rel(si["profiles"][0]["area_mm2"].as_f64().unwrap(), profile) < 1e-9, "{si}");
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "solid.extrude", json!({"distance": 10}));
+    let counts = |s: &mut Session| {
+        let m = run(s, "inspect.measure", json!({}));
+        (m["total"]["faces"].as_u64(), m["total"]["edges"].as_u64(), m["total"]["vertices"].as_u64())
+    };
+    assert_eq!(counts(&mut s), (Some(4), Some(6), Some(4)));
+    let (gp, gq) = (round_gap(c1, r1, c2, r2, p, 6.0), round_gap(c1, r1, c2, r2, q, 6.0));
+    // One round: a blend face; the edge becomes two contact lines and two end arcs.
+    run(&mut s, "solid.fillet", json!({"edges": [[p[0], p[1], 5]], "radius": 6, "name": "Round"}));
+    let (v, expect) = (volume(&mut s), (profile + gp) * 10.0);
+    assert!(rel(v, expect) < 2e-4, "{v} vs {expect}");
+    assert_eq!(counts(&mut s), (Some(5), Some(9), Some(6)));
+    // Both corners in one fillet.
+    run(
+        &mut s,
+        "timeline.redefine",
+        json!({"feature": "Round", "command": "solid.fillet", "params": {"edges": [[p[0], p[1], 5], [q[0], q[1], 5]], "radius": 6}}),
+    );
+    let (v, expect) = (volume(&mut s), (profile + gp + gq) * 10.0);
+    assert!(rel(v, expect) < 2e-4, "{v} vs {expect}");
+    assert_eq!(counts(&mut s), (Some(6), Some(12), Some(8)));
+    // A larger round, whose contacts are found on the long arcs from their far ends too.
+    run(&mut s, "timeline.redefine", json!({"feature": "Round", "command": "solid.fillet", "params": {"edges": [[q[0], q[1], 5]], "radius": 13}}));
+    let (v, expect) = (volume(&mut s), (profile + round_gap(c1, r1, c2, r2, q, 13.0)) * 10.0);
+    assert!(rel(v, expect) < 2e-4, "{v} vs {expect}");
+}
+
+/// A bar 40 long, 16 wide and 10 tall whose far end is a half disc of radius 8 about (40, 8),
+/// with a disc of radius 8 about the same centre sketched on its top (the top's outline
+/// projected) and extruded 10 up, joined: the bar's sides run tangent into the cylinder.
+/// V0 = 40·16·10 + π·8²·10/2 + π·8²·10.
+fn peg(s: &mut Session) -> f64 {
+    run(s, "sketch.create", json!({"plane": "XY", "name": "Peg"}));
+    run(s, "sketch.line", json!({"points": [[0, 0], [40, 0]]}));
+    run(s, "sketch.arc.center_point", json!({"center": [40, 8], "start": [40, 0], "end": [40, 16]}));
+    run(s, "sketch.line", json!({"points": [[40, 16], [0, 16]]}));
+    run(s, "sketch.line", json!({"points": [[0, 16], [0, 0]]}));
+    run(s, "sketch.finish", json!({}));
+    run(s, "solid.extrude", json!({"sketch": "Peg", "distance": 10, "body_name": "Peg"}));
+    run(s, "sketch.create", json!({"plane": {"origin": [0, 0, 10], "x_dir": [1, 0, 0], "y_dir": [0, 1, 0]}, "name": "Top"}));
+    run(s, "sketch.project", json!({"refs": [{"face": [2, 8, 10]}]}));
+    run(s, "sketch.circle.center", json!({"center": [40, 8], "radius": 8}));
+    run(s, "sketch.finish", json!({}));
+    run(
+        s,
+        "solid.extrude",
+        json!({"sketch": "Top", "distance": 10, "operation": "join", "targets": ["Peg"], "profiles": [{"point": [40, 8]}], "exact_regions": true}),
+    );
+    6400.0 + 960.0 * PI
+}
+
+/// Simpson's rule over [a, b] with `n` (even) intervals.
+fn simpson(f: impl Fn(f64) -> f64, a: f64, b: f64, n: usize) -> f64 {
+    let h = (b - a) / n as f64;
+    let inner: f64 = (1..n).map(|i| if i % 2 == 1 { 4.0 } else { 2.0 } * f(a + h * i as f64)).sum();
+    (f(a) + f(b) + inner) * h / 3.0
+}
+
+/// The material an r2 round of the peg's front top edge (y = 0, z = 10) takes off: the spandrel
+/// (height 2 - sqrt(4 - (2 - y)²) above the round at y) from x = `from` to where the cylinder's
+/// wall, x = 40 - sqrt(64 - (8 - y)²), takes over (the round runs into the wall there).
+fn peg_front_round(from: f64) -> f64 {
+    let spandrel = |y: f64| 2.0 - (4.0 - (2.0 - y) * (2.0 - y)).max(0.0).sqrt();
+    let wall = |y: f64| 40.0 - (64.0 - (8.0 - y) * (8.0 - y)).max(0.0).sqrt();
+    simpson(|y| spandrel(y) * (wall(y) - from), 0.0, 2.0, 20_000)
+}
+
+/// The peg's front top edge rounded r2: SMLib's result holds the upper half of the cylinder's
+/// wall as a rational spline whose parameter range runs more than a turn round, past the face's
+/// trims (half a turn). Taken as a cylinder over the spline's range (past 360°) SMLib refused it
+/// on the way back (SM_ERR_INVALID_INPUT), so the round seemed to build and the body could not
+/// be measured or changed. It goes back as the cylinder over the face's own range: the body
+/// measures, a round of the three edges at the bar's other top corner builds on it, and that
+/// wall comes back from SMLib a cylinder of radius 8.
+#[test]
+fn rounds_on_a_bar_running_tangent_into_a_cylinder() {
+    let mut s = Session::default();
+    let v0 = peg(&mut s);
+    run(&mut s, "solid.fillet", json!({"edges": [[20, 0, 10]], "radius": 2}));
+    let (v, expect) = (volume(&mut s), v0 - peg_front_round(0.0));
+    assert!(rel(v, expect) < 1e-7, "{v} vs {expect}");
+    // The vertical edge, the left top edge and the round's end arc on the left face: each
+    // spandrel (1 - π/4)·r² along the edge outside the corner cube of side 2, the cube less the
+    // rolling ball's eighth, 8 - 4π/3.
+    run(&mut s, "solid.fillet", json!({"edges": [[0, 0, 4], [0, 9, 10], [0, 0.5858, 9.4142]], "radius": 2}));
+    let strip = (1.0 - PI / 4.0) * 4.0;
+    let expect = v0 - peg_front_round(2.0) - strip * (8.0 + 14.0) - (8.0 - 4.0 * PI / 3.0);
+    let v = volume(&mut s);
+    assert!(rel(v, expect) < 1e-7, "{v} vs {expect}");
+    for b in &s.model.state().bodies {
+        let bad = b.body.validity();
+        assert!(bad.is_empty(), "{}: {bad:?}", b.name);
+    }
+    // The wall's upper half (x < 40, z in [10, 20], round (40, 8)): every face on the surface
+    // through (32, 8, 15) is a cylinder of radius 8.
+    let state = s.model.state();
+    let rec = state.bodies[0].body.record();
+    let p0 = solidcore_record::Vec3::new(32.0, 8.0, 15.0);
+    let on: Vec<&solidcore_record::brep::Surface> = rec
+        .faces
+        .iter()
+        .map(|f| &f.surface)
+        .filter(|s| {
+            let e = solidcraft_geom::brep::eval::SurfaceEval::new(s).ok();
+            e.and_then(|e| e.project(p0, None, 1e-6).and_then(|uv| e.point(uv))).is_some_and(|q| q.dist(p0) < 1e-6)
+        })
+        .collect();
+    let kinds: Vec<String> = on.iter().map(|s| format!("{s:?}").chars().take(48).collect()).collect();
+    assert!(
+        !on.is_empty() && on.iter().all(|s| matches!(s, solidcore_record::brep::Surface::Cylinder { radius, .. } if (radius - 8.0).abs() < 1e-9)),
+        "{kinds:?}"
+    );
+}
+
+/// After the peg's front top round, the edge where that round runs into the cylinder's wall: its
+/// faces are tangent at its lower end (40, 0, 8), where the round's contact with the front face
+/// meets the wall's tangent line with it, and meet at a crease everywhere else. It is no smooth
+/// edge (it was refused as one, judged at that end alone); the wall's seam with the front face,
+/// tangent all along, still is.
+#[test]
+fn an_edge_tangent_at_one_end_only_is_not_smooth() {
+    let mut s = Session::default();
+    peg(&mut s);
+    run(&mut s, "solid.fillet", json!({"edges": [[20, 0, 10]], "radius": 2}));
+    let fillet = |s: &mut Session, at: [f64; 3]| s.execute("solid.fillet", &json!({"edges": [at], "radius": 1, "tangent_chain": false}));
+    if let Err(e) = fillet(&mut s, [37.2641, 0.4827, 9.3025]) {
+        assert!(!e.to_string().contains("is smooth"), "{e}");
+    }
+    let seam = fillet(&mut s, [40.0, 0.0, 4.0]).unwrap_err().to_string();
+    assert!(seam.contains("is smooth: its faces meet tangentially"), "{seam}");
+}
+
+/// The top outline of two overlapping cylinders whose concave edges were rounded: the walls of
+/// the rounds meet the cylinders along the rolling-ball contact lines, straight but not lines.
+#[test]
+fn fillet_and_chamfer_the_top_loop_of_rounded_overlapping_cylinders() {
+    use std::f64::consts::{PI, TAU};
+    let (big, round, h) = (25.0_f64, 5.0_f64, 10.0);
+    let mut s = Session::default();
+    run(&mut s, "sketch.create", json!({"plane": "XY"}));
+    run(&mut s, "sketch.circle.center", json!({"center": [0, 0], "radius": big}));
+    run(&mut s, "sketch.circle.center", json!({"center": [-big, 0], "radius": big}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "solid.extrude", json!({"distance": h, "profiles": [0, 1, 2]}));
+    // Plan view: ball centres at x = −12.5, |y| = yb; each round's arc turns by th, each big arc by
+    // TAU − 2·a1, and the loop turns by TAU in all.
+    let half = big / 2.0;
+    let yb = ((big + round).powi(2) - half * half).sqrt();
+    run(&mut s, "solid.fillet", json!({"edges": [[-half, half * 3f64.sqrt(), 5], [-half, -half * 3f64.sqrt(), 5]], "radius": round}));
+    let (a1, th) = (yb.atan2(half), 2.0 * (half / (big + round)).asin());
+    let base = volume(&mut s);
+    let top = [[big, 0.0, h], [-2.0 * big, 0.0, h], [-half, yb - round, h], [-half, round - yb, h]];
+    // Removed volume by Pappus: the corner's section swept along the loop at its centroid's offset.
+    let removed = |area: f64, xb: f64| area * (2.0 * (TAU - 2.0 * a1) * (big - xb) + 2.0 * th * (round + xb));
+    run(&mut s, "solid.fillet", json!({"edges": top, "radius": 2}));
+    let r: f64 = 2.0;
+    let expect = base - removed(r * r * (1.0 - PI / 4.0), (10.0 - 3.0 * PI) / (3.0 * (4.0 - PI)) * r);
+    let v = volume(&mut s);
+    assert!((v - expect).abs() < 1.5, "{v} vs {expect}");
+    let m = run(&mut s, "inspect.measure", json!({}));
+    assert_eq!(m["bodies"][0]["kernel"]["faces"].as_u64(), Some(10), "{m}");
+    run(&mut s, "edit.undo", json!({}));
+    run(&mut s, "solid.chamfer", json!({"edges": top, "distance": 2}));
+    let expect = base - removed(2.0, 2.0 / 3.0);
+    let v = volume(&mut s);
+    assert!((v - expect).abs() < 1.5, "{v} vs {expect}");
+}
+
+/// Sketch a 40 x 30 rectangle with dimensions, extrude 20, fillet a vertical edge, cut a hole.
+#[test]
+fn box_fillet_cut_part() {
+    let mut s = Session::default();
+    run(&mut s, "parameters.change", json!({"name": "width", "expression": "40 mm"}));
+    run(&mut s, "sketch.create", json!({"plane": "XY"}));
+    let r = run(&mut s, "sketch.rectangle.two_point", json!({"p0": [0, 0], "p1": [38, 29]}));
+    let l: Vec<String> = r["curves"].as_array().unwrap().iter().map(|v| v.as_str().unwrap().to_string()).collect();
+    let corner = s.doc.sketch(s.active_sketch.unwrap()).unwrap().curves[0].clone();
+    let start = match corner.kind {
+        solidcraft_sketch::CurveKind::Line { a, .. } => s.doc.sketch(s.active_sketch.unwrap()).unwrap().points[a].id.clone(),
+        _ => panic!(),
+    };
+    run(&mut s, "sketch.constraint.coincident", json!({"a": start, "b": "origin"}));
+    run(&mut s, "sketch.dimension", json!({"entities": [l[0]], "value": "width"}));
+    run(&mut s, "sketch.dimension", json!({"entities": [l[1]], "value": 30}));
+    let si = run(&mut s, "sketch.inspect", json!({}));
+    assert_eq!(si["dof"], 0, "{si}");
+    assert_eq!(si["profiles"].as_array().unwrap().len(), 1);
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "solid.extrude", json!({"distance": 20}));
+    assert!(rel(volume(&mut s), 24000.0) < 1e-9);
+    run(&mut s, "solid.fillet", json!({"edges": [[0, 0, 10]], "radius": 3}));
+    let filleted = 24000.0 - (9.0 - PI * 9.0 / 4.0) * 20.0;
+    assert!(rel(volume(&mut s), filleted) < 2e-4);
+    run(&mut s, "sketch.create", json!({"plane": "XY"}));
+    run(&mut s, "sketch.circle.center", json!({"center": [20, 15], "radius": 5}));
+    run(&mut s, "solid.extrude", json!({"distance": 20, "operation": "cut"}));
+    let expect = filleted - PI * 25.0 * 20.0;
+    let v = volume(&mut s);
+    assert!(rel(v, expect) < 5e-4, "{v} vs {expect}");
+    let m = run(&mut s, "inspect.measure", json!({}));
+    assert_eq!(m["bodies"][0]["faces"], 8, "{m}");
+
+    // Parameter edit re-evaluates the timeline from the sketch.
+    let r = run(&mut s, "parameters.change", json!({"name": "width", "expression": "50"}));
+    assert_eq!(r["errors"].as_array().unwrap().len(), 0, "{r}");
+    let expect2 = 30000.0 - (9.0 - PI * 9.0 / 4.0) * 20.0 - PI * 25.0 * 20.0;
+    assert!(rel(volume(&mut s), expect2) < 5e-4);
+
+    // Undo the parameter change, redo it.
+    run(&mut s, "edit.undo", json!({}));
+    assert!(rel(volume(&mut s), expect) < 5e-4);
+    run(&mut s, "edit.redo", json!({}));
+    assert!(rel(volume(&mut s), expect2) < 5e-4);
+
+    // Export STL and STEP.
+    let dir = std::env::temp_dir().join(format!("solidcraft-test-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let stl = dir.join("part.stl");
+    run(&mut s, "file.export", json!({"path": stl.to_string_lossy()}));
+    assert!(std::fs::metadata(&stl).unwrap().len() > 1000);
+    let step = dir.join("part.step");
+    run(&mut s, "file.export", json!({"path": step.to_string_lossy()}));
+    assert!(std::fs::read_to_string(&step).unwrap().contains("ISO-10303-21"));
+    let design = dir.join("part.solidcraft");
+    run(&mut s, "file.save_as", json!({"path": design.to_string_lossy()}));
+    let mut s2 = Session::default();
+    run(&mut s2, "doc.open", json!({"path": design.to_string_lossy()}));
+    assert!(rel(volume(&mut s2), expect2) < 5e-4);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn revolve_and_primitives() {
+    let mut s = Session::default();
+    run(&mut s, "sketch.create", json!({"plane": "XZ"}));
+    run(&mut s, "sketch.line", json!({"points": [[10, 0], [15, 0], [15, 5], [10, 5]], "closed": true}));
+    run(&mut s, "solid.revolve", json!({"axis": "y"}));
+    assert!(rel(volume(&mut s), PI * 125.0 * 5.0) < 5e-4);
+    run(&mut s, "solid.box", json!({"length": 10, "width": 10, "height": 10, "corner": [30, 0, 0]}));
+    run(&mut s, "solid.cylinder", json!({"diameter": 4, "height": 20, "base": [35, 5, -5]}));
+    run(&mut s, "solid.combine", json!({"target": "Body2", "tools": ["Body3"], "operation": "cut"}));
+    let m = run(&mut s, "inspect.measure", json!({}));
+    assert_eq!(m["body_count"], 2, "{m}");
+    assert!(rel(m["bodies"][1]["volume_mm3"].as_f64().unwrap(), 1000.0 - PI * 4.0 * 10.0) < 5e-4);
+    run(&mut s, "solid.chamfer", json!({"edges": [[30, 5, 10]], "distance": 1}));
+    run(&mut s, "timeline.rollback", json!({"position": 3}));
+    assert_eq!(run(&mut s, "inspect.measure", json!({}))["body_count"], 2);
+    run(&mut s, "timeline.rollback", json!({}));
+    run(&mut s, "timeline.edit", json!({"feature": "Revolve1", "set": {"angle": "180 deg"}}));
+    let m = run(&mut s, "inspect.measure", json!({"bodies": ["Body1"]}));
+    assert!(rel(m["total"]["volume_mm3"].as_f64().unwrap(), PI * 125.0 * 5.0 / 2.0) < 5e-4);
+}
+
+/// #726: a revolve swept each profile edge into two or three patches and left the planar ones
+/// apart, so a pick on such a face took part of it, and a sketch or an extrude there was refused
+/// ("the selected planar face no longer exists") until a later feature merged them.
+#[test]
+fn revolved_planar_faces_come_out_whole() {
+    for angle in [360, 240] {
+        let mut s = Session::default();
+        run(&mut s, "sketch.create", json!({"plane": "XZ"}));
+        run(&mut s, "sketch.line", json!({"points": [[8, 0], [30, 0], [30, -6], [18, -6], [18, -22], [8, -22]], "closed": true}));
+        run(&mut s, "sketch.finish", json!({}));
+        run(&mut s, "solid.revolve", json!({"axis": "Z", "angle": angle}));
+        // Picks at 170°, in the last patch, which 240° covers whichever way it turns.
+        let at = |r: f64, z: f64| json!([r * 170f64.to_radians().cos(), r * 170f64.to_radians().sin(), z]);
+        // The flange's top annulus (z = 6, r 18…30), well inside it.
+        let sk = run(&mut s, "sketch.create", json!({"plane": {"face": at(24.0, 6.0)}}));
+        assert_eq!(sk["attachment"], "exact_face", "{angle}°: {sk}");
+        run(&mut s, "sketch.finish", json!({}));
+        // The bottom annulus (z = 0, r 8…30).
+        let v = volume(&mut s);
+        run(&mut s, "solid.extrude", json!({"face": at(20.0, 0.0), "distance": 2, "operation": "join"}));
+        assert!(volume(&mut s) > v + 1.0, "{angle}°: the extrude added nothing");
+    }
+}
+
+/// A profile edge almost square to the axis that rises less along it than the cone
+/// recogniser's height floor (1e-6 mm) comes out a surface of revolution, which the body reads
+/// back with, so the body measures (#17085). Before, Revolve wrote a cone the record reader
+/// refused ("a NURBS form that is not its analytic surface"): Revolve reported success and
+/// Measure and Fillet then failed. The axis is `l1` (along X), so the fourth point's offset
+/// `dx` is the edge's rise along the axis; 1e-7 on a full turn is the issue's own script.
+/// Controls, which measured before the fix too: square (dx 0) the edge sweeps a plane, a rise
+/// of 1e-9 is not written as a cone, and at dx 1e-5 the cone is tall enough to read back. The
+/// 1e-6 relative bound is Measure's accuracy with room (the doc of
+/// `solidcraft_smlib::MEASURE_ACCURACY`: analytic primitives within 2e-7 of their
+/// closed forms): it shows the body measures at the right volume, not that it resolves the
+/// rise (1e-9 changes the volume by 1e-10 relative).
+#[test]
+fn revolved_edge_almost_square_to_the_axis_reads_back() {
+    // Pappus, for each turn and offset of the fourth point (exact rational arithmetic on the
+    // profile, times 2 pi and the turn's share of a full one).
+    let cases = [
+        ("360 deg", 0.0, 61.308285354560), // control
+        ("360 deg", 1e-7, 61.308286062989),
+        ("360 deg", 1e-9, 61.308285361644), // control
+        ("360 deg", -1e-7, 61.308284646131),
+        ("360 deg", 1e-5, 61.308356197474), // control
+        ("90 deg", 1e-7, 15.327071515747),
+        ("90 deg", 1e-9, 15.327071340411), // control
+        ("90 deg", -1e-7, 15.327071161533),
+    ];
+    let mut wrong = Vec::new();
+    for (angle, dx, want) in cases {
+        let mut s = Session::default();
+        run(&mut s, "sketch.create", json!({"plane": "XZ"}));
+        run(&mut s, "sketch.line", json!({"points": [[0, 0], [6, 0], [6, 1], [6.0 + dx, 1.01], [5, 2.5], [0, 1]], "closed": true}));
+        run(&mut s, "sketch.finish", json!({}));
+        run(&mut s, "solid.revolve", json!({"axis": "l1", "angle": angle, "body_name": "B"}));
+        let v = volume(&mut s);
+        if rel(v, want) >= 1e-6 {
+            wrong.push(format!("{angle} dx {dx:e}: volume {v}, want {want}"));
+        }
+    }
+    // A sketch fillet that leaves a short remnant of an edge drawn a hair off square: the edge
+    // from (6, 1) to (6 + dx, 2) is rounded into the top by 0.95, leaving 0.05 of it, which
+    // rises 5e-7 along the axis at dx 1e-5. Each is measured against its closed form (Pappus
+    // on the outline less the fillet's corner, the kite between corner, tangent points and
+    // centre less the circular sector, worked in double precision; square, the corner is
+    // r^2 (1 - pi/4) at its centroid), to the same bound. Square (dx 0) is the control.
+    for (dx, want) in [(0.0, 73.222621144273), (1e-5, 73.222625776381)] {
+        let mut s = Session::default();
+        run(&mut s, "sketch.create", json!({"plane": "XZ"}));
+        run(&mut s, "sketch.line", json!({"points": [[0, 0], [6, 0], [6, 1], [6.0 + dx, 2], [0, 2]], "closed": true}));
+        run(&mut s, "sketch.fillet", json!({"a": "l3", "b": "l4", "radius": 0.95}));
+        run(&mut s, "sketch.finish", json!({}));
+        run(&mut s, "solid.revolve", json!({"axis": "l1", "angle": "360 deg", "body_name": "B"}));
+        let v = volume(&mut s);
+        if rel(v, want) >= 1e-6 {
+            wrong.push(format!("filleted dx {dx:e}: volume {v}, want {want}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// A spherical shell (a half ring between two arcs, both radial lines on the axis) revolved on a
+/// sketch plane that does not pass through the origin: the body is the shell, as it is on XY.
+/// Before, built in place, it measured a third too large (truck tessellates the degenerate faces
+/// on the axis reliably only with the axis through the origin).
+#[test]
+fn revolve_a_spherical_shell_off_the_origin() {
+    for (plane, z) in [(json!("XY"), 0.0), (json!({"origin": [0, 0, 10], "x_dir": [1, 0, 0], "y_dir": [0, 1, 0]}), 10.0)] {
+        let mut s = Session::default();
+        run(&mut s, "sketch.create", json!({"plane": plane, "name": "Ring"}));
+        run(&mut s, "sketch.line", json!({"points": [[-40, 0], [40, 0]]}));
+        run(&mut s, "sketch.arc.center_point", json!({"center": [0, 0], "start": [40, 0], "end": [-40, 0]}));
+        run(&mut s, "sketch.arc.center_point", json!({"center": [0, 0], "start": [18.5, 0], "end": [-18.5, 0]}));
+        run(&mut s, "sketch.finish", json!({}));
+        // The half ring: the larger of the two regions above the axis.
+        let si = run(&mut s, "sketch.inspect", json!({"sketch": "Ring"}));
+        let ring = si["profiles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .max_by(|a, b| a["area_mm2"].as_f64().unwrap().total_cmp(&b["area_mm2"].as_f64().unwrap()))
+            .unwrap()["index"]
+            .clone();
+        run(&mut s, "solid.revolve", json!({"sketch": "Ring", "profiles": [ring], "axis": "l1", "body_name": "Shell"}));
+        let m = run(&mut s, "inspect.measure", json!({"bodies": ["Shell"]}));
+        let want = 4.0 / 3.0 * PI * (40.0f64.powi(3) - 18.5f64.powi(3));
+        let v = m["total"]["volume_mm3"].as_f64().unwrap();
+        assert!(rel(v, want) < 5e-4, "plane at z {z}: {v} vs {want}");
+        let b = &m["bodies"][0]["bbox"];
+        assert!((b["min"][2].as_f64().unwrap() - (z - 40.0)).abs() < 1e-6 && (b["max"][2].as_f64().unwrap() - (z + 40.0)).abs() < 1e-6, "{b}");
+    }
+}
+
+#[test]
+fn extrude_of_adjacent_profiles_has_whole_edges() {
+    // A holder from two regions of one sketch (a disc and the ring around it, both cut off by a
+    // chord): the chord used to stay split where the inner circle met it, leaving vertices right
+    // on the surface of a handle of that radius, and cutting the handle out of the holder failed.
+    let mut s = Session::default();
+    run(&mut s, "sketch.create", json!({"plane": "XZ", "name": "Holder"}));
+    run(&mut s, "sketch.circle.center", json!({"center": [0, 0], "radius": 40}));
+    run(&mut s, "sketch.circle.center", json!({"center": [0, 0], "radius": 35}));
+    let x = (40.0f64 * 40.0 - 33.0 * 33.0).sqrt();
+    run(&mut s, "sketch.line", json!({"points": [[-x, -33], [x, -33]]}));
+    run(&mut s, "sketch.finish", json!({}));
+    let si = run(&mut s, "sketch.inspect", json!({"sketch": "Holder"}));
+    let below: Vec<Value> = si["profiles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|p| (500.0..4900.0).contains(&p["area_mm2"].as_f64().unwrap()))
+        .map(|p| p["index"].clone())
+        .collect();
+    assert_eq!(below.len(), 2, "{si}");
+    run(&mut s, "solid.extrude", json!({"sketch": "Holder", "profiles": below, "distance": 23, "body_name": "Holder"}));
+    let topo = run(&mut s, "model.faces", json!({"body": "Holder"}));
+    // The arc side (one face: SMLib keeps a cylinder's arc of more than half a turn whole), the
+    // chord's flat side and the two ends.
+    assert_eq!(topo["faces"].as_array().unwrap().len(), 4, "a cut-off cylinder: {topo}");
+    let lo = run(&mut s, "inspect.measure", json!({"bodies": ["Holder"]}))["bodies"][0]["bbox"]["min"][1].as_f64().unwrap();
+    run(&mut s, "solid.move", json!({"bodies": ["Holder"], "translate": [0, -5.0 - lo, 0]}));
+    // The handle: r35 on the Y axis with a bevelled end.
+    run(&mut s, "sketch.create", json!({"plane": "XY", "name": "Handle"}));
+    for pts in [
+        [[0.0, 0.0], [0.0, 230.0]],
+        [[0.0, 0.0], [25.0, 0.0]],
+        [[25.0, 0.0], [35.0, 11.5]],
+        [[35.0, 11.5], [35.0, 230.0]],
+        [[35.0, 230.0], [0.0, 230.0]],
+    ] {
+        run(&mut s, "sketch.line", json!({ "points": pts }));
+    }
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "solid.revolve", json!({"sketch": "Handle", "profiles": [0], "axis": "Y", "body_name": "Handle"}));
+    let before = run(&mut s, "inspect.measure", json!({"bodies": ["Holder"]}))["total"]["volume_mm3"].as_f64().unwrap();
+    run(&mut s, "solid.combine", json!({"target": "Holder", "tools": ["Handle"], "operation": "cut", "keep_tools": true}));
+    let after = run(&mut s, "inspect.measure", json!({"bodies": ["Holder"]}))["total"]["volume_mm3"].as_f64().unwrap();
+    assert!(after > 1000.0 && after < before * 0.5, "{before} -> {after}");
+}
+
+#[test]
+fn sketch_tools_and_constraints() {
+    let mut s = Session::default();
+    run(&mut s, "sketch.create", json!({"plane": "YZ"}));
+    run(&mut s, "sketch.rectangle.center", json!({"center": [0, 0], "corner": [10, 5]}));
+    run(&mut s, "sketch.rectangle.three_point", json!({"p0": [20, 0], "p1": [30, 5], "p2": [28, 10]}));
+    run(&mut s, "sketch.circle.two_point", json!({"p0": [40, 0], "p1": [44, 0]}));
+    run(&mut s, "sketch.circle.three_point", json!({"p0": [50, 0], "p1": [52, 2], "p2": [54, 0]}));
+    run(&mut s, "sketch.arc.three_point", json!({"start": [60, 0], "end": [64, 0], "through": [62, 2]}));
+    run(&mut s, "sketch.arc.center_point", json!({"center": [70, 0], "start": [72, 0], "end": [70, 2]}));
+    run(&mut s, "sketch.polygon.inscribed", json!({"center": [80, 0], "radius": 3, "sides": 6}));
+    run(&mut s, "sketch.polygon.circumscribed", json!({"center": [90, 0], "radius": 3, "sides": 5}));
+    run(&mut s, "sketch.polygon.edge", json!({"p0": [100, 0], "p1": [103, 0], "sides": 4}));
+    run(&mut s, "sketch.slot.center_to_center", json!({"p0": [110, 0], "p1": [120, 0], "width": 4}));
+    run(&mut s, "sketch.slot.overall", json!({"p0": [130, 0], "p1": [140, 0], "width": 4}));
+    run(&mut s, "sketch.point", json!({"point": [150, 0]}));
+    let r = run(&mut s, "sketch.line", json!({"points": [[0, 20], [10, 21], [20, 30]], "ids": ["m1", "m2"]}));
+    assert_eq!(r["curves"], json!(["m1", "m2"]));
+    run(&mut s, "sketch.constraint.horizontal_vertical", json!({"line": "m1"}));
+    run(&mut s, "sketch.constraint.perpendicular", json!({"a": "m1", "b": "m2"}));
+    let _ = s.execute("sketch.dimension", &json!({"entities": ["m1", "m2"], "type": "angle", "value": "90 deg"}));
+    let si = run(&mut s, "sketch.inspect", json!({}));
+    assert_eq!(si["status"], "solved", "{}", si["failing"]);
+    // Over-constraining is rejected and leaves the sketch unchanged.
+    let before = s.doc.clone();
+    assert!(s.execute("sketch.constraint.parallel", &json!({"a": "m1", "b": "m2"})).is_err());
+    assert_eq!(*s.doc, *before);
+    // Profiles: rectangles, circles, closed arcs/polygons/slots.
+    let n = si["profiles"].as_array().unwrap().len();
+    assert!(n >= 8, "{n} profiles");
+    run(&mut s, "sketch.construction", json!({"curves": ["m1"]}));
+    run(&mut s, "sketch.delete", json!({"entities": ["m2"]}));
+    run(&mut s, "sketch.constraint.fix", json!({"entity": "m1"}));
+    run(&mut s, "sketch.move_point", json!({"point": "m1.end", "to": [15, 20]}));
+    run(&mut s, "sketch.finish", json!({}));
+    assert!(s.execute("sketch.line", &json!({"points": [[0, 0], [1, 1]]})).is_err(), "needs an active sketch");
+}
+
+/// The recipe format of the 01-box reference drives the same commands.
+#[test]
+fn script_runs_commands() {
+    let mut s = Session::default();
+    let script = json!({"commands": [
+        {"command": "sketch.create", "params": {"plane": "XY"}},
+        {"command": "sketch.line", "params": {"points": [[0, 0], [40, 0], [40, 30], [0, 30]], "closed": true, "ids": ["l1", "l2", "l3", "l4"]}},
+        {"command": "solid.extrude", "params": {"distance": 20, "profiles": [{"loops": [{"outer": true, "curves": ["l1", "l2", "l3", "l4"]}]}], "body_name": "Box"}},
+    ]});
+    let out = s.run_script(&script).unwrap();
+    assert_eq!(out.len(), 3);
+    let m = run(&mut s, "inspect.measure", json!({}));
+    assert_eq!(m["bodies"][0]["name"], "Box");
+    assert_eq!((m["total"]["faces"].as_u64(), m["total"]["edges"].as_u64(), m["total"]["vertices"].as_u64()), (Some(6), Some(12), Some(8)));
+    assert!(s.run_script(&json!([{"command": "Nope"}])).is_err());
+}
+
+pub(crate) fn hostile_values() -> Vec<Value> {
+    vec![
+        Value::Null,
+        json!(true),
+        json!(-1),
+        json!(0),
+        json!(1e308),
+        json!(-1e308),
+        json!(""),
+        json!("nope"),
+        json!("1/0"),
+        json!("((((((((((1"),
+        json!("w = 20"),
+        json!("w ="),
+        json!("= 20"),
+        json!("mm = 5"),
+        json!("w = w"),
+        json!("w == 1/0"),
+        // Every value input reads `name = expression` (#4071).
+        json!("a = = 3"),
+        json!("é = 1e308 * 10"),
+        json!(format!("{} = 1", "n".repeat(5000))),
+        json!([]),
+        json!([1e308, -1e308]),
+        json!([0, 0, 0]),
+        json!([[0, 0], [0, 0]]),
+        json!(["origin", "origin"]),
+        json!({}),
+        json!({"x": 1}),
+        json!([{"point": [0, 0]}]),
+        json!([{"body": "Body1", "index": 999999}]),
+    ]
+}
+
+/// A copy of `s` as it stands: its design and model (sharing their bodies, as undo does), its
+/// undo and redo, its open sketch and the design it was entered from, and its log.
+fn copy_with_history(s: &Session) -> Session {
+    Session { undo: s.undo.clone(), redo: s.redo.clone(), sketch_entry: s.sketch_entry.clone(), log: s.log.clone(), ..s.scratch() }
+}
+
+/// The hostile-parameter test's copy starts where a session built afresh stands: cancelling its
+/// sketch and undoing step for step give the same designs, and the copied session is untouched.
+#[test]
+fn a_copy_with_history_undoes_like_the_session_it_copies() {
+    let start = |s: &mut Session| {
+        run(s, "solid.box", json!({"length": 10, "width": 10, "height": 10}));
+        run(s, "sketch.create", json!({"plane": "XY"}));
+        run(s, "sketch.rectangle.two_point", json!({"p0": [0, 0], "p1": [5, 5]}));
+    };
+    let mut fresh = Session::default();
+    start(&mut fresh);
+    let mut original = Session::default();
+    start(&mut original);
+    let before = original.doc.clone();
+    let mut copy = copy_with_history(&original);
+    for (command, params) in [("sketch.cancel", json!({})), ("edit.undo", json!({})), ("edit.undo", json!({})), ("edit.redo", json!({}))] {
+        run(&mut fresh, command, params.clone());
+        run(&mut copy, command, params);
+        assert_eq!(*fresh.doc, *copy.doc, "{command}");
+        assert_eq!(fresh.active_sketch, copy.active_sketch, "{command}");
+    }
+    assert!(std::sync::Arc::ptr_eq(&original.doc, &before) && original.active_sketch.is_some(), "the copied session is untouched");
+}
+
+/// Every command, every parameter name it documents, every hostile value: no panic escapes and
+/// no command panics internally.
+#[test]
+fn hostile_params_never_panic() {
+    // `file.slicers` gets every hostile value like every command, but lists made-up slicers (none)
+    // instead of searching this machine's programs on each of its ~5,600 calls: a third of a second
+    // a call on Windows, half an hour in all. The tests that make slicers up take turns, and
+    // `MadeUp` puts the real search back.
+    let _turn = mesh_convert::CHOSEN_PROGRAMS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _reset = mesh_convert::MadeUp;
+    *crate::slicers::TEST_DETECTED.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Vec::new());
+    let keys = [
+        "plane",
+        "offset",
+        "name",
+        "sketch",
+        "points",
+        "closed",
+        "construction",
+        "ids",
+        "infer",
+        "p0",
+        "p1",
+        "p2",
+        "center",
+        "corner",
+        "radius",
+        "diameter",
+        "start",
+        "end",
+        "through",
+        "sides",
+        "angle",
+        "width",
+        "point",
+        "id",
+        "entities",
+        "type",
+        "value",
+        "line",
+        "mode",
+        "a",
+        "b",
+        "entity",
+        "fixed",
+        "curves",
+        "to",
+        "distance",
+        "profiles",
+        "direction",
+        "parallel_to",
+        "distance2",
+        "start_offset",
+        "operation",
+        "targets",
+        "body_name",
+        "axis",
+        "length",
+        "height",
+        "base",
+        "major",
+        "minor",
+        "top_radius",
+        "top_diameter",
+        "edges",
+        "body",
+        "target",
+        "tools",
+        "keep_tools",
+        "bodies",
+        "translate",
+        "expression",
+        "unit",
+        "comment",
+        "delete",
+        "features",
+        "feature",
+        "position",
+        "suppressed",
+        "set",
+        "items",
+        "add",
+        "path",
+        "format",
+        "ascii",
+        "measure",
+        "refs",
+        "link",
+        "project_edges",
+        "mid",
+        "near",
+        "factor",
+        "copy",
+        "count",
+        "spacing",
+        "count2",
+        "spacing2",
+        "dir",
+        "side",
+        "chain",
+        "at",
+        "curve",
+        "minor_radius",
+        "apex",
+        "rho",
+        "text",
+        "lines",
+        "driven",
+        "from",
+        "datum",
+        "tolerance",
+        "face",
+        "new_name",
+        "favorite",
+        "favorites",
+        "filter",
+        "kind",
+        "detail",
+        "prefix",
+        "orientation",
+        "seam",
+        "twist",
+        "scale",
+        "continuity",
+        "crown",
+        "faces",
+        "u",
+        "v",
+        "keep",
+        "with",
+        "keep_with",
+        "stitch",
+        "extend",
+        "view",
+        "visual_style",
+        "reference_style",
+        "reference_hides_model",
+        "reference_shown_percent",
+        "tangent_edges",
+        "line_group",
+        "sheet",
+        "position_mm",
+        "profile",
+        "anchor",
+        "density",
+        "names",
+        "pairs",
+        "next_pair",
+        "members",
+        "references",
+        "head",
+        "head_gap",
+        "configuration",
+        "outline",
+        "outline_text",
+        "drills",
+        "drills_text",
+        "thickness",
+        "origin",
+        "shape",
+        "size",
+        "web",
+        "clip",
+        "margin",
+        "through_all",
+        "depth",
+        "dot_grid",
+        "turn",
+    ];
+    // Commands are independent; worker threads take them one at a time (their costs vary a lot).
+    let ids: Vec<&str> = command_specs()
+        .iter()
+        .map(|spec| spec.id)
+        .filter(|id| !matches!(*id, "doc.open" | "file.save" | "file.save_as" | "file.export" | "file.save_mesh" | "sketch.export_dxf")) // file system side effects are covered by their own tests
+        .collect();
+    assert!(ids.contains(&"inspect.classify_points"), "exact point inspection must receive every hostile value");
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
+    let internal: Vec<String> = std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..threads)
+            .map(|_| {
+                scope.spawn(|| {
+                    let mut internal = Vec::new();
+                    while let Some(&id) = ids.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed)) {
+                        // A model with a sketch, a body and an active sketch, so most commands get far.
+                        // Built once per command and copied for each call: SMLib serialises every
+                        // call behind one lock, so building the box for each of the ~3000 calls
+                        // ran one after another on every thread (over half an hour in CI).
+                        let mut start = Session::default();
+                        // Hostile plugin ids must never name packages in the user's real install folder.
+                        start.plugin_state.plugins_dir = Some(solidcraft_io::vfs::temp_dir().join(format!(
+                            "solidcraft-hostile-plugins-{}-{}",
+                            std::process::id(),
+                            id.replace('.', "-")
+                        )));
+                        let _ = start.execute("solid.box", &json!({"length": 10, "width": 10, "height": 10}));
+                        let _ = start.execute("sketch.create", &json!({"plane": "XY"}));
+                        let _ = start.execute("sketch.rectangle.two_point", &json!({"p0": [0, 0], "p1": [5, 5]}));
+                        for v in hostile_values() {
+                            for k in keys {
+                                if k == "path"
+                                    && (id.starts_with("parameters.")
+                                        || id == "timeline.export_script"
+                                        || matches!(
+                                            id,
+                                            "file.export_3mf"
+                                                | "file.export_obj"
+                                                | "file.export_sdf"
+                                                | "file.export_step"
+                                                | "file.export_stl"
+                                                | "file.export_urdf"
+                                        ))
+                                {
+                                    continue; // parameter, script and export files: covered by their own tests (no stray files)
+                                }
+                                let mut s = copy_with_history(&start);
+                                let p = json!({ k: v.clone() });
+                                if let Err(EngineError::Internal(id, msg)) = s.execute(id, &p) {
+                                    internal.push(format!("{id} {p}: {msg}"));
+                                }
+                                // Whole-value hostility too.
+                                if let Err(EngineError::Internal(id, msg)) = s.execute(id, &v) {
+                                    internal.push(format!("{id} {v}: {msg}"));
+                                }
+                            }
+                        }
+                    }
+                    internal
+                })
+            })
+            .collect();
+        workers.into_iter().flat_map(|w| w.join().unwrap()).collect()
+    });
+    assert!(internal.is_empty(), "commands panicked:\n{}", internal.join("\n"));
+}
+
+/// #6651: a list parameter of the wrong type is refused, not read as an empty list. An empty
+/// list means "every body" to most commands, so a number, an object or a list with a number in
+/// it was read as no list at all: a cut meant for one body cut every body it touched, and the
+/// command reported success.
+///
+/// `null` is not in this list: the schema contract declares these parameters optional and
+/// reads `null` as absent, so it keeps the meaning it always had (no list given).
+#[test]
+fn a_list_parameter_of_the_wrong_type_is_refused() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"corner": [0, 0, 0], "length": 40, "width": 30, "height": 10, "body_name": "Plate"}));
+    run(&mut s, "solid.box", json!({"corner": [60, 0, 0], "length": 10, "width": 10, "height": 20, "body_name": "Block"}));
+    let before = volume(&mut s);
+    // A tool crossing both bodies, meant for the Block only.
+    for targets in [json!(7), json!(true), json!({"body": "Block"}), json!(["Block", 42])] {
+        let params =
+            json!({"corner": [35, 2, -1], "length": 30, "width": 3, "height": 30, "operation": "cut", "body_name": "Slot", "targets": targets});
+        let err = s.execute("solid.box", &params).expect_err("a list parameter of the wrong type is refused");
+        let EngineError::BadParams { cmd, msg } = &err else {
+            panic!("{params}: {err}");
+        };
+        assert_eq!(cmd, "solid.box", "{params}: {err}");
+        assert!(msg.contains("targets"), "{params}: {err}");
+        assert_eq!(volume(&mut s), before, "{params}: the design changed");
+    }
+}
+
+#[test]
+fn registry_is_consistent() {
+    let specs = command_specs();
+    let mut ids: Vec<&str> = specs.iter().map(|c| c.id).collect();
+    ids.sort();
+    let n = ids.len();
+    ids.dedup();
+    assert_eq!(ids.len(), n, "duplicate command ids");
+    assert_eq!(find_command("Solid.Extrude").map(|c| c.id), Some("solid.extrude"), "case-insensitive lookup");
+    let s = Session::default();
+    assert!(!find_command("sketch.line").unwrap().info(&s).enabled);
+}
+
+/// One reading of a command id for everything that decides on it: any
+/// case and surrounding whitespace name the registered command; an id with any character that
+/// is not printable ASCII (a look-alike letter, a zero-width or non-breaking space inside) names
+/// none, so the engine never runs a command a gate took for something else. No two registered
+/// ids differ only in case, so a case variant names exactly one.
+#[test]
+fn command_ids_resolve_one_way() {
+    for (given, id) in [
+        ("FILE.SAVE", "file.save"),
+        (" file.open_in_easyprint ", "file.open_in_easyprint"),
+        ("\tDiagnostics.Crash_Reports\n", "diagnostics.crash_reports"),
+        ("\u{a0}DOC.OPEN\u{3000}", "doc.open"),
+    ] {
+        assert_eq!(find_command(given).map(|c| c.id), Some(id), "{given:?}");
+    }
+    for alike in ["fil\u{0435}.save", "file\u{ff0e}save", "\u{200b}file.save", "file.\u{200d}save", "FILE.SAVE\u{200b}", "\u{ff46}ile.save", "", "  "]
+    {
+        assert!(find_command(alike).is_none(), "{alike:?}");
+        assert!(matches!(Session::default().execute(alike, &json!({})), Err(EngineError::UnknownCommand(_))), "{alike:?}");
+    }
+    let mut lower: Vec<String> = command_specs().iter().map(|c| c.id.to_ascii_lowercase()).collect();
+    let n = lower.len();
+    lower.sort();
+    lower.dedup();
+    assert_eq!(lower.len(), n, "two command ids differ only in case");
+    assert!(command_specs().iter().all(|c| normalize_command_id(c.id) == Some(c.id)), "a registered id that does not read as itself");
+}
+
+/// Only SolidCraft's own dotted ids name commands; other ids are unknown commands.
+#[test]
+fn only_own_ids_name_commands() {
+    for old in ["Extrude", "SketchCreate", "FusionFilletEdgesCommand"] {
+        assert!(find_command(old).is_none(), "{old}");
+        let mut s = Session::default();
+        let err = s.execute(old, &serde_json::json!({})).unwrap_err();
+        assert!(matches!(err, crate::EngineError::UnknownCommand(_)), "{old}: {err}");
+    }
+}
+
+/// An unknown command's error names the ids it was probably meant to be: a typo's, or the
+/// commands that end in the same word, the nearest first.
+#[test]
+fn unknown_commands_suggest_the_closest_ids() {
+    let mut s = Session::default();
+    let mut msg = |id: &str| s.execute(id, &serde_json::json!({})).unwrap_err().to_string();
+    assert_eq!(msg("file.open"), "unknown command `file.open` (did you mean `doc.open`, `panel.open` or `drawing.open`?)");
+    assert!(msg("solid.extrud").starts_with("unknown command `solid.extrud` (did you mean `solid.extrude`"), "{}", msg("solid.extrud"));
+    assert!(msg("tab.window.clsoe").starts_with("unknown command `tab.window.clsoe` (did you mean `tab.window.close`"));
+    assert!(msg("Extrude").contains("`solid.extrude`"), "{}", msg("Extrude"));
+    assert_eq!(msg("FusionFilletEdgesCommand"), "unknown command `FusionFilletEdgesCommand`");
+    let long = "x".repeat(10_000);
+    assert_eq!(msg(&long), format!("unknown command `{long}`"));
+}
+
+/// Common verbs recover the command in the same namespace, without executing an alias.
+#[test]
+fn unknown_commands_suggest_equivalent_verbs_in_the_same_namespace() {
+    for (id, candidate) in [("note.create", "notes.add"), ("render.lights.create", "render.cameras.add"), ("create", "add"), (".create", ".add")] {
+        assert!(!crate::cmd::command_verb_alternative(id, candidate), "{id}: {candidate}");
+    }
+    let mut s = Session::default();
+    for (id, wanted) in [
+        ("note.create", "note.add"),
+        ("NOTE.CREATE", "note.add"),
+        ("note.new", "note.add"),
+        ("note.remove", "note.delete"),
+        ("parameters.create", "parameters.add"),
+        ("render.lights.create", "render.lights.add"),
+        ("render.lights.delete", "render.lights.remove"),
+    ] {
+        let error = s.execute(id, &json!({})).unwrap_err();
+        assert!(matches!(error, crate::EngineError::UnknownCommand(_)), "{id}: {error}");
+        let message = error.to_string();
+        assert!(message.starts_with(&format!("unknown command `{id}` (did you mean `{wanted}`")), "{message}");
+    }
+}
+
+#[test]
+fn sample_design_builds() {
+    let mut s = Session::default();
+    s.run_script(&crate::sample::script()).unwrap();
+    let m = run(&mut s, "inspect.measure", json!({}));
+    assert_eq!(m["body_count"], 1, "{m}");
+    let plate = 80.0 * 50.0 * 8.0 - 4.0 * (36.0 - PI * 9.0) * 8.0 - 2.0 * PI * 16.0 * 8.0;
+    let boss = PI * 144.0 * 14.0;
+    let bore = PI * 36.0 * 22.0;
+    let v = m["total"]["volume_mm3"].as_f64().unwrap();
+    assert!(rel(v, plate + boss - bore) < 1e-3, "{v} vs {}", plate + boss - bore);
+}
+
+fn silhouette_box(s: &mut Session, name: &str, x0: f64, x1: f64, z: f64) {
+    let sketch = format!("{name}Sketch");
+    run(s, "sketch.create", json!({"plane": "XY", "name": sketch}));
+    run(s, "sketch.rectangle.two_point", json!({"p0": [x0, 0], "p1": [x1, 10]}));
+    run(s, "sketch.finish", json!({}));
+    run(s, "solid.extrude", json!({"sketch": sketch, "distance": z, "operation": "new_body", "body_name": name}));
+}
+
+fn silhouette_pixels(v: &Value) -> usize {
+    v["mask"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row.as_array().unwrap().iter().map(|span| (span[1].as_u64().unwrap() - span[0].as_u64().unwrap()) as usize).sum::<usize>())
+        .sum()
+}
+
+#[test]
+fn silhouette_box_standard_views_and_full_mask() {
+    let mut s = Session::default();
+    silhouette_box(&mut s, "Box", 0.0, 20.0, 30.0);
+    let front = run(&mut s, "inspect.silhouette", json!({"rows": 60}));
+    assert_eq!(front["box_mm"], json!([[0.0, 0.0], [20.0, 30.0]]));
+    assert_eq!(front["mm_per_px"], 0.5);
+    assert_eq!((front["width"].as_u64(), front["height"].as_u64()), (Some(40), Some(60)));
+    assert_eq!(silhouette_pixels(&front), 2400);
+    assert_eq!(front["bodies"], 1);
+    let right = run(&mut s, "inspect.silhouette", json!({"view": "right", "rows": 60}));
+    assert_eq!(right["box_mm"], json!([[0.0, 0.0], [10.0, 30.0]]));
+    assert_eq!((right["width"].as_u64(), right["height"].as_u64()), (Some(20), Some(60)));
+    let top = run(&mut s, "inspect.silhouette", json!({"view": "top", "rows": 60}));
+    assert_eq!(top["box_mm"], json!([[0.0, 0.0], [20.0, 10.0]]));
+    assert_eq!((top["width"].as_u64(), top["height"].as_u64()), (Some(120), Some(60)));
+}
+
+#[test]
+fn silhouette_front_and_back_mirror_tall_body() {
+    let mut s = Session::default();
+    silhouette_box(&mut s, "Tall", 0.0, 10.0, 30.0);
+    silhouette_box(&mut s, "Short", 30.0, 40.0, 10.0);
+    let front = run(&mut s, "inspect.silhouette", json!({"view": "front", "rows": 60}));
+    let back = run(&mut s, "inspect.silhouette", json!({"view": "back", "rows": 60}));
+    assert_eq!(front["mask"][0], json!([[0, 20]]));
+    assert_eq!(back["mask"][0], json!([[60, 80]]));
+    assert_eq!(front["right"], json!([1.0, 0.0, 0.0]));
+    assert_eq!(back["right"], json!([-1.0, 0.0, 0.0]));
+}
+
+#[test]
+fn silhouette_visibility_selection_and_bad_input() {
+    let mut s = Session::default();
+    silhouette_box(&mut s, "Shown", 0.0, 20.0, 30.0);
+    silhouette_box(&mut s, "Hidden", 40.0, 50.0, 10.0);
+    run(&mut s, "browser.visibility", json!({"items": ["Hidden"], "visible": false}));
+    assert_eq!(run(&mut s, "inspect.silhouette", json!({}))["bodies"], 1);
+    let named = run(&mut s, "inspect.silhouette", json!({"bodies": ["Hidden"]}));
+    assert_eq!(named["bodies"], 1);
+    assert_eq!(named["box_mm"], json!([[40.0, 0.0], [50.0, 10.0]]));
+    assert!(s.execute("inspect.silhouette", &json!({"bodies": ["Unknown"]})).unwrap_err().to_string().contains("Unknown"));
+    assert!(s.execute("inspect.silhouette", &json!({"view": "front", "camera": {}})).is_err());
+    assert!(s.execute("inspect.silhouette", &json!({"camera": {"target": [0,0,0], "yaw": 0, "pitch": 0, "distance": 0}})).is_err());
+}
+
+#[test]
+fn silhouette_perspective_scales_the_near_face_and_refuses_bodies_behind_the_eye() {
+    let mut s = Session::default();
+    silhouette_box(&mut s, "Box", 0.0, 20.0, 30.0);
+    // Looking along +Y at the box's centre from 100 mm: the near face (Y 0) is 95 mm from the
+    // eye, so it is drawn 100/95 times its size on the plane through the target.
+    let camera = json!({"target": [10, 5, 15], "yaw": 0, "pitch": 0, "distance": 100, "fov": 0.6});
+    let perspective = run(&mut s, "inspect.silhouette", json!({"camera": camera, "rows": 60}));
+    assert_eq!(perspective["projection"], "perspective");
+    assert_eq!(perspective["box_mm"], json!([[-0.5263, -0.7895], [20.5263, 30.7895]]));
+    let flat = json!({"target": [10, 5, 15], "yaw": 0, "pitch": 0, "distance": 100});
+    let parallel = run(&mut s, "inspect.silhouette", json!({"camera": flat, "rows": 60}));
+    assert_eq!(parallel["projection"], "parallel");
+    assert_eq!(parallel["box_mm"], json!([[0.0, 0.0], [20.0, 30.0]]));
+    let inside = json!({"target": [10, 5, 15], "yaw": 0, "pitch": 0, "distance": 1, "fov": 0.6});
+    assert!(s.execute("inspect.silhouette", &json!({"camera": inside})).unwrap_err().to_string().contains("behind the camera"));
+    // Between two bodies, looking -X from X 28: Short (X 30..40) is behind the eye.
+    silhouette_box(&mut s, "Short", 30.0, 40.0, 10.0);
+    let between = json!({"target": [25, 5, 15], "yaw": -std::f64::consts::FRAC_PI_2, "pitch": 0, "distance": 3, "fov": 0.6});
+    assert!(s.execute("inspect.silhouette", &json!({"camera": between})).unwrap_err().to_string().contains("behind the camera"));
+    assert_eq!(run(&mut s, "inspect.silhouette", json!({"camera": between, "bodies": ["Box"]}))["bodies"], 1);
+}
+
+#[test]
+fn silhouette_is_an_agent_command_not_a_toolbar_button() {
+    let specs = command_specs();
+    let spec = specs.iter().find(|c| c.id == "inspect.silhouette").unwrap();
+    assert!(spec.tab.is_empty(), "{} › {}", spec.tab, spec.panel);
+    assert!(!spec.undoable);
+}
+
+#[test]
+fn sample_edges_chain_and_faces() {
+    let mut s = Session::default();
+    s.run_script(&crate::sample::script()).unwrap();
+    let st = s.model.state();
+    let m = st.bodies[0].mesh();
+    let e = (0..m.edges.len()).find(|i| m.edges[*i].iter().all(|p| (p.z - 8.0).abs() < 1e-6 && p.y.abs() < 1e-6)).expect("front top edge");
+    let chain = m.tangent_chain(e, 2f64.to_radians());
+    // The plate's top outline: 4 lines and 4 corner arcs (a boolean may leave an edge twice,
+    // once per face; count distinct ones).
+    let mut mids: Vec<solidcore_record::Vec3> = Vec::new();
+    for i in &chain {
+        let p = &m.edges[*i];
+        let mid = p[p.len() / 2];
+        assert!(p.iter().all(|q| (q.z - 8.0).abs() < 1e-6), "{p:?}");
+        if !mids.iter().any(|q| q.dist(mid) < 1e-6) {
+            mids.push(mid);
+        }
+    }
+    assert_eq!(mids.len(), 8, "{chain:?}");
+    // Every edge bounds a face, and the top face has the outline and the hole rims.
+    assert!(m.edge_faces.iter().all(|f| !f.is_empty()));
+}
+
+/// timeline.inspect returns a feature's definition in the shape timeline.edit's `set` takes, so
+/// an agent can read the field names instead of guessing them.
+#[test]
+fn timeline_inspect_shows_what_timeline_edit_changes() {
+    let mut s = Session::default();
+    run(&mut s, "sketch.create", json!({"plane": "XY", "name": "Base"}));
+    run(&mut s, "sketch.rectangle.two_point", json!({"p0": [0, 0], "p1": [40, 30]}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "solid.extrude", json!({"distance": 10, "name": "Slab"}));
+    run(&mut s, "solid.fillet", json!({"edges": [[20, 0, 10]], "radius": 2, "name": "Round"}));
+    let i = run(&mut s, "timeline.inspect", json!({"feature": "Slab"}));
+    assert_eq!(i["type"], "extrude", "{i}");
+    assert_eq!(i["type_name"], "ExtrudeFeature", "{i}");
+    assert_eq!(i["definition"]["extent"]["distance"], "10", "{i}");
+    assert_eq!(i["definition"]["operation"], "new_body", "{i}");
+    assert!(i["definition"].get("type").is_none() && i["definition"].get("param_names").is_none(), "{i}");
+    assert_eq!(i["inputs"][0]["label"], "Distance", "{i}");
+    assert_eq!(i["inputs"][0]["unit"], "mm", "{i}");
+    let d = i["inputs"][0]["param"].as_str().unwrap().to_string();
+    // The definition's field names are what timeline.edit takes.
+    run(&mut s, "timeline.edit", json!({"feature": "Slab", "set": {"extent": {"distance": "12"}}}));
+    let i = run(&mut s, "timeline.inspect", json!({"feature": i["id"]}));
+    assert_eq!(i["definition"]["extent"]["distance"], "12", "{i}");
+    assert_eq!(i["inputs"][0]["param"], d.as_str(), "{i}");
+    let f = run(&mut s, "timeline.inspect", json!({"feature": "Round"}));
+    assert_eq!(f["definition"]["radius"], "2", "{f}");
+    run(&mut s, "timeline.edit", json!({"feature": "Round", "set": {"radius": "3"}}));
+    assert_eq!(run(&mut s, "timeline.inspect", json!({"feature": "Round"}))["definition"]["radius"], "3");
+    // A sketch leaves its geometry out (sketch.inspect has it) and says so.
+    let k = run(&mut s, "timeline.inspect", json!({"feature": "Base"}));
+    assert!(k["definition"].get("sketch").is_none() && k["definition"].get("plane").is_some(), "{k}");
+    assert_eq!(k["omitted"][0]["field"], "sketch", "{k}");
+    // Read-only: no undo step; bad input is refused.
+    let undo = s.undo.len();
+    run(&mut s, "timeline.inspect", json!({"feature": "Slab"}));
+    assert_eq!(s.undo.len(), undo);
+    for bad in [json!({}), json!({"feature": "Nope"}), json!({"feature": [1]}), json!({"feature": 1e300}), json!({"feature": null})] {
+        assert!(s.execute("timeline.inspect", &bad).is_err(), "{bad}");
+    }
+}
+
+#[test]
+fn timeline_edits_reresolve_references() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 40, "width": 30, "height": 20, "name": "Base"}));
+    run(&mut s, "solid.fillet", json!({"edges": [[20, 0, 20]], "radius": 3, "name": "Round"}));
+    run(&mut s, "solid.hole", json!({"position": [20, 15, 20], "diameter": 6, "name": "Bore"}));
+    let fillet = |l: f64| (9.0 - 9.0 * PI / 4.0) * l;
+    let expect = |l: f64, h: f64| l * 30.0 * h - fillet(l) - PI * 9.0 * h;
+    assert!(rel(volume(&mut s), expect(40.0, 20.0)) < 1e-3);
+    // Taller box: the fillet's edge point is now 5 mm below the edge; the edge is found by its
+    // name (no warning) and the hole moves up with the top face.
+    run(&mut s, "timeline.edit", json!({"feature": "Base", "set": {"height": "25"}}));
+    assert!(rel(volume(&mut s), expect(40.0, 25.0)) < 1e-3, "{}", volume(&mut s));
+    let round = s.doc.find_feature("Round").map(|f| f.id).unwrap();
+    assert_eq!(s.model.result(round).and_then(|r| r.warning.clone()), None);
+    // Longer box: the point still lies on the (longer) edge.
+    run(&mut s, "timeline.edit", json!({"feature": "Base", "set": {"length": "60"}}));
+    assert!(rel(volume(&mut s), expect(60.0, 25.0)) < 1e-3, "{}", volume(&mut s));
+    // Reorder: the fillet can't go before the box; the hole can go before the fillet.
+    let e = s.execute("timeline.reorder", &json!({"feature": "Round", "position": 0})).unwrap_err().to_string();
+    assert!(e.contains("breaks"), "{e}");
+    run(&mut s, "timeline.reorder", json!({"feature": "Bore", "position": 1}));
+    let names: Vec<&str> = s.doc.features.iter().map(|f| f.name.as_str()).collect();
+    assert_eq!(names, ["Base", "Bore", "Round"]);
+    assert!(rel(volume(&mut s), expect(60.0, 25.0)) < 1e-3);
+    // Redefine the fillet in place with a new radius; it keeps its name and position.
+    run(&mut s, "timeline.redefine", json!({"feature": "Round", "command": "solid.fillet", "params": {"edges": [[30, 0, 25]], "radius": 4}}));
+    let f4 = (16.0 - 16.0 * PI / 4.0) * 60.0;
+    assert!(rel(volume(&mut s), 60.0 * 30.0 * 25.0 - f4 - PI * 9.0 * 25.0) < 1e-3);
+    assert_eq!(s.doc.features.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(), ["Base", "Bore", "Round"]);
+    // Dependents and roll back.
+    let d = run(&mut s, "timeline.dependents", json!({"feature": "Base"}));
+    assert_eq!(d["would_fail"].as_array().map(|a| a.len()), Some(2), "{d}");
+    run(&mut s, "timeline.roll_to", json!({"feature": "Base"}));
+    assert!(rel(volume(&mut s), 60.0 * 30.0 * 25.0) < 1e-6);
+    run(&mut s, "timeline.roll_to", json!({}));
+    run(&mut s, "edit.undo", json!({}));
+    run(&mut s, "edit.undo", json!({}));
+    assert!(rel(volume(&mut s), 60.0 * 30.0 * 25.0 - f4 - PI * 9.0 * 25.0) < 1e-3);
+}
+
+/// A 40 × 30 × 20 box exported to a STEP file in a fresh temp directory.
+fn step_box_file(tag: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("solidcraft-step-{tag}-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 40, "width": 30, "height": 20}));
+    let p = dir.join("Block.step");
+    run(&mut s, "file.export", json!({"path": p.to_string_lossy()}));
+    p
+}
+
+/// #15111: a STEP file just opened is a design never saved, yet closing it loses nothing the file
+/// doesn't hold: `unchanged_import` says so until the design changes, a body is hidden or it is
+/// saved as a design. A design file opened is never one.
+#[test]
+fn an_opened_step_file_is_an_unchanged_import_until_it_changes() {
+    let p = step_box_file("unchanged");
+    let open = || {
+        let mut s = Session::default();
+        run(&mut s, "doc.open", json!({"path": p.to_string_lossy()}));
+        s
+    };
+    let mut s = open();
+    assert!(s.is_dirty() && s.unchanged_import());
+    run(&mut s, "inspect.measure", json!({}));
+    assert!(s.unchanged_import(), "measuring changes nothing");
+    let body = s.model.state().bodies[0].name.clone();
+    run(&mut s, "browser.visibility", json!({"items": [body], "visible": false}));
+    assert!(!s.unchanged_import(), "a hidden body is a change to save");
+    run(&mut s, "edit.undo", json!({}));
+    assert!(s.unchanged_import(), "undone, the design is the file again");
+    run(&mut s, "solid.box", json!({"length": 5, "width": 5, "height": 5, "corner": [100, 0, 0]}));
+    assert!(!s.unchanged_import(), "a new feature is a change");
+
+    let mut s = open();
+    let saved = p.with_extension("sc");
+    run(&mut s, "file.save_as", json!({"path": saved.to_string_lossy()}));
+    assert!(!s.is_dirty() && !s.unchanged_import(), "saved, it is a design like any other");
+    let mut again = Session::default();
+    run(&mut again, "doc.open", json!({"path": saved.to_string_lossy()}));
+    assert!(!again.unchanged_import(), "a design file is not an import");
+    let _ = std::fs::remove_dir_all(p.parent().unwrap());
+}
+
+/// File → Open of a STEP file gives an Import base feature, and features work on its faces.
+#[test]
+fn step_open_then_model_on_it() {
+    let p = step_box_file("open");
+    let mut s = Session::default();
+    let r = run(&mut s, "doc.open", json!({"path": p.to_string_lossy()}));
+    assert_eq!(r["features"], 1, "{r}");
+    assert_eq!(s.doc.name, "Block");
+    assert_eq!(s.doc.features[0].kind.type_name(), "BaseFeature");
+    assert!(matches!(&s.doc.features[0].kind, doc::FeatureKind::Import { file, .. } if file == "Block.step"));
+    assert!(s.is_dirty() && s.path.is_none() && s.undo.is_empty());
+    assert!(rel(volume(&mut s), 24000.0) < 1e-6);
+    let corner = run(&mut s, "inspect.measure", json!({}))["bodies"][0]["bbox"]["min"].clone();
+    let (x0, y0, z0) = (corner[0].as_f64().unwrap(), corner[1].as_f64().unwrap(), corner[2].as_f64().unwrap());
+    let at = |x: f64, y: f64, z: f64| json!([x0 + x, y0 + y, z0 + z]);
+
+    // Fillet a vertical edge, drill a through hole, cut a pocket sketched on the top face.
+    run(&mut s, "solid.fillet", json!({"edges": [at(0.0, 0.0, 10.0)], "radius": 3}));
+    let mut want = 24000.0 - (9.0 - PI * 9.0 / 4.0) * 20.0;
+    assert!(rel(volume(&mut s), want) < 2e-4);
+    run(&mut s, "solid.hole", json!({"position": at(28.0, 15.0, 20.0), "diameter": 6}));
+    want -= PI * 9.0 * 20.0;
+    assert!(rel(volume(&mut s), want) < 5e-4, "{} vs {want}", volume(&mut s));
+    // Modified imported faces no longer have an immutable construction certificate; the top
+    // attaches by its exact history name instead.
+    let top = run(&mut s, "sketch.create", json!({"plane": {"face": at(10.0, 15.0, 20.0)}}))["sketch"].as_u64().unwrap();
+    assert!(matches!(
+        s.placed_document().sketch_face_attachment(top, &s.model),
+        doc::FaceAttachmentStatus::Healthy {
+            target: doc::config::ConfigFaceTarget { certificate: Some(doc::config::FaceCertificate::Lineage), .. },
+            ..
+        }
+    ));
+    let c = [x0 + 10.0, y0 + 15.0];
+    // Sketch coordinates on the face are relative to the model origin projected onto it.
+    run(&mut s, "sketch.rectangle.two_point", json!({"p0": [c[0] - 4.0, c[1] - 4.0], "p1": [c[0] + 4.0, c[1] + 4.0]}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "solid.extrude", json!({"distance": -5, "operation": "cut"}));
+    want -= 64.0 * 5.0;
+    assert!(rel(volume(&mut s), want) < 5e-4, "{} vs {want}", volume(&mut s));
+    assert_eq!(s.model.results.iter().filter(|r| r.error.is_some()).count(), 0);
+
+    // The design saves and reopens without the STEP file.
+    let before = volume(&mut s);
+    let design = p.with_extension("solidcraft");
+    run(&mut s, "file.save_as", json!({"path": design.to_string_lossy()}));
+    std::fs::remove_file(&p).unwrap();
+    let mut s2 = Session::default();
+    run(&mut s2, "doc.open", json!({"path": design.to_string_lossy()}));
+    assert!(rel(volume(&mut s2), before) < 1e-6);
+}
+
+/// A join onto an imported body of thousands of planar faces (a converted mesh, say): each face of
+/// the result was compared with every planar face of the inputs whose source is unknown, and the
+/// join was refused past the comparison budget.
+#[test]
+fn join_onto_a_finely_faceted_import() {
+    let dir = std::env::temp_dir().join(format!("solidcraft-step-faceted-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let n = 4000;
+    let mut pts: Vec<[f64; 2]> =
+        (0..n).map(|i| std::f64::consts::TAU * f64::from(i) / f64::from(n)).map(|a| [20.0 * a.cos(), 20.0 * a.sin()]).collect();
+    pts.push(pts[0]);
+    let mut s = Session::default();
+    run(&mut s, "sketch.create", json!({"plane": "XY", "name": "P"}));
+    run(&mut s, "sketch.line", json!({"points": pts}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "solid.extrude", json!({"sketch": "P", "distance": 10}));
+    let p = dir.join("Faceted.step");
+    run(&mut s, "file.export", json!({"path": p.to_string_lossy()}));
+    let prism = volume(&mut s);
+
+    let mut d = Session::default();
+    // The import is a component (#1386): the pin is made in it to join its body.
+    let r = run(&mut d, "file.insert_step", json!({"path": p.to_string_lossy()}));
+    run(&mut d, "component.activate", json!({"component": r["component"]}));
+    run(&mut d, "sketch.create", json!({"plane": "XY", "name": "Pin"}));
+    run(&mut d, "sketch.rectangle.two_point", json!({"p0": [-5, -5], "p1": [5, 5]}));
+    run(&mut d, "sketch.finish", json!({}));
+    run(&mut d, "solid.extrude", json!({"sketch": "Pin", "distance": 25, "operation": "join"}));
+    assert_eq!(d.model.state().bodies.len(), 1);
+    assert!(rel(volume(&mut d), prism + 10.0 * 10.0 * 15.0) < 1e-6, "{}", volume(&mut d));
+}
+
+/// #8192: `file.insert_step`'s `matrix` translation takes length expressions. The import keeps the
+/// ones that name parameters and follows them, through undo, a save and an open; numbers keep
+/// working; a bad expression, or one outside the translation column, is refused before the file is
+/// read and leaves the design as it was.
+#[test]
+fn step_insert_matrix_translation_follows_its_parameters() {
+    let p = step_box_file("insert-expr");
+    let mut d = Session::default();
+    run(&mut d, "solid.box", json!({"length": 5, "width": 5, "height": 5, "corner": [100, 0, 0]}));
+    run(&mut d, "parameters.add", json!({"name": "station", "expression": "10 mm"}));
+    let r = run(&mut d, "file.insert_step", json!({"path": p.to_string_lossy(), "matrix": [1, 0, 0, "station", 0, 1, 0, "2 mm", 0, 0, 1, 0]}));
+    let occ = r["occurrence"].as_u64().unwrap();
+    // A grounded occurrence stays put (its expressions keep up), so the import is let go.
+    run(&mut d, "occurrence.ground", json!({"occurrence": occ, "grounded": false}));
+    let x = |d: &Session| d.doc.occurrences.iter().find(|o| o.id == occ).unwrap().transform[3];
+    assert_eq!(x(&d)[..3], [10.0, 2.0, 0.0], "{r}");
+    assert_eq!(r["transform"][3][0], 10.0, "{r}");
+    let o = d.doc.occurrences.iter().find(|o| o.id == occ).unwrap();
+    assert_eq!(o.expressed_moves.len(), 1);
+    assert_eq!(o.expressed_moves[0].translate, [Some("station".to_string()), None, None], "text that names no parameter is a number");
+
+    run(&mut d, "parameters.change", json!({"name": "station", "expression": "25 mm"}));
+    assert_eq!(x(&d)[..3], [25.0, 2.0, 0.0]);
+    run(&mut d, "edit.undo", json!({}));
+    assert_eq!(x(&d)[..3], [10.0, 2.0, 0.0]);
+    run(&mut d, "edit.redo", json!({}));
+    assert_eq!(x(&d)[..3], [25.0, 2.0, 0.0]);
+
+    // Saved and opened, it still follows.
+    let saved = p.with_file_name("placed.sc");
+    run(&mut d, "file.save", json!({"path": saved.to_string_lossy()}));
+    let mut opened = Session::default();
+    run(&mut opened, "doc.open", json!({"path": saved.to_string_lossy()}));
+    run(&mut opened, "parameters.change", json!({"name": "station", "expression": "40 mm"}));
+    let o = opened.doc.occurrences.iter().find(|o| o.id == occ).unwrap();
+    assert_eq!(o.transform[3][..3], [40.0, 2.0, 0.0]);
+
+    // Numbers work as they did and keep nothing.
+    let mut n = Session::default();
+    run(&mut n, "solid.box", json!({"length": 5, "width": 5, "height": 5, "corner": [100, 0, 0]}));
+    let r = run(&mut n, "file.insert_step", json!({"path": p.to_string_lossy(), "matrix": [1, 0, 0, 10, 0, 1, 0, 2, 0, 0, 1, 0]}));
+    assert_eq!(r["transform"][3][0], 10.0, "{r}");
+    assert!(n.doc.occurrences.iter().all(|o| o.expressed_moves.is_empty()));
+
+    // Refused: the design is as it was, and the file is not read for a bad matrix.
+    let before = d.doc.clone();
+    for (matrix, expected) in [
+        (json!([1, 0, 0, "nope", 0, 1, 0, 0, 0, 0, 1, 0]), "matrix translation `nope`"),
+        (json!([1, 0, 0, "30 deg", 0, 1, 0, 0, 0, 0, 1, 0]), "matrix translation `30 deg`"),
+        (json!([1, 0, 0, 0, 0, "station", 0, 0, 0, 0, 1, 0]), "only its translation column"),
+    ] {
+        let e = d.execute("file.insert_step", &json!({"path": p.to_string_lossy(), "matrix": matrix})).unwrap_err().to_string();
+        assert!(e.contains(expected), "{e}");
+        assert_eq!(d.doc, before);
+    }
+}
+
+/// Shell an imported body; insert STEP into an existing design; extension case; bad files.
+#[test]
+fn step_insert_shell_and_errors() {
+    let p = step_box_file("insert");
+    let upper = p.with_file_name("BLOCK.STP");
+    std::fs::copy(&p, &upper).unwrap();
+    let mut s = Session::default();
+    run(&mut s, "doc.open", json!({"path": upper.to_string_lossy()}));
+    let top = run(&mut s, "inspect.measure", json!({}))["bodies"][0]["bbox"]["max"].clone();
+    let (x1, y1, z1) = (top[0].as_f64().unwrap(), top[1].as_f64().unwrap(), top[2].as_f64().unwrap());
+    run(&mut s, "solid.shell", json!({"faces": [[x1 - 20.0, y1 - 15.0, z1]], "thickness": 2}));
+    let walls = 24000.0 - 36.0 * 26.0 * 18.0;
+    assert!(rel(volume(&mut s), walls) < 5e-4, "{}", volume(&mut s));
+
+    let mut d = Session::default();
+    run(&mut d, "solid.box", json!({"length": 5, "width": 5, "height": 5, "corner": [100, 0, 0]}));
+    let r = run(&mut d, "file.insert_step", json!({"path": p.to_string_lossy()}));
+    assert_eq!(r["bodies"].as_array().unwrap().len(), 1, "{r}");
+    run(&mut d, "file.insert_step", json!({"path": p.to_string_lossy()}));
+    let names: Vec<String> = d.model.state().bodies.iter().map(|b| b.name.clone()).collect();
+    assert_eq!(names.len(), 3);
+    let mut uniq = names.clone();
+    uniq.dedup();
+    assert_eq!(uniq.len(), 3, "{names:?}");
+    assert!(rel(volume(&mut d), 125.0 + 48000.0) < 1e-6);
+    run(&mut d, "edit.undo", json!({}));
+    assert_eq!(d.model.state().bodies.len(), 2);
+
+    let junk = p.with_file_name("junk.step");
+    std::fs::write(&junk, "ISO-10303-21;\nDATA;\n#1=CARTESIAN_POINT('',(0.,0.,0.));\nENDSEC;\nEND-ISO-10303-21;\n").unwrap();
+    let before = d.doc.clone();
+    assert!(d.execute("file.insert_step", &json!({"path": junk.to_string_lossy()})).is_err());
+    assert!(d.execute("doc.open", &json!({"path": junk.to_string_lossy()})).is_err());
+    assert!(d.execute("file.insert_step", &json!({"path": "/nonexistent/a.step"})).is_err());
+    assert!(d.execute("file.insert_step", &json!({"path": p.with_extension("stl").to_string_lossy()})).is_err());
+    assert_eq!(*d.doc, *before);
+}
+
+fn body_volume(st: &solidcraft_doc::ModelState) -> f64 {
+    st.bodies.iter().map(|b| solidcraft_kernel::measure(&b.body).unwrap().volume).sum()
+}
+
+/// What an import found wrong is told where it is (`document.inspect`'s `defects`, the Browser's
+/// marks): a part whose shell lacks a face on its body, a part that could not be read on
+/// the component that would have held it. The bodies that read are all there.
+#[test]
+fn step_insert_tells_which_body_and_component_its_problems_are_in() {
+    let dir = std::env::temp_dir().join(format!("solidcraft-step-defects-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("parts.step");
+    let mut source = Session::default();
+    run(&mut source, "component.create", json!({"name": "Left"}));
+    run(&mut source, "solid.box", json!({"length": 10, "width": 10, "height": 10, "operation": "new", "body_name": "Torn"}));
+    run(&mut source, "component.activate", json!({"component": "root"}));
+    run(&mut source, "component.create", json!({"name": "Right"}));
+    for (name, x) in [("Kept", 20), ("Lost", 40)] {
+        run(&mut source, "solid.box", json!({"length": 10, "width": 10, "height": 10, "corner": [x, 0, 0], "operation": "new", "body_name": name}));
+    }
+    // Pin, whose only part is lost, is placed in Left and again in Right.
+    run(&mut source, "component.create", json!({"name": "Pin", "parent": "Left"}));
+    run(&mut source, "solid.box", json!({"length": 2, "width": 2, "height": 2, "corner": [60, 0, 0], "operation": "new", "body_name": "Gone"}));
+    run(&mut source, "component.activate", json!({"component": "root"}));
+    run(&mut source, "occurrence.copy", json!({"component": "Pin", "parent": "Right", "translate": [0, 20, 0]}));
+    run(&mut source, "file.export", json!({"path": path.to_string_lossy()}));
+    let text = std::fs::read_to_string(&path).unwrap();
+    // The solid `name` and its shell's entity line.
+    let solid = |name: &str| {
+        let line = text.lines().find(|l| l.contains("MANIFOLD_SOLID_BREP") && l.contains(&format!("'{name}'"))).unwrap_or_else(|| panic!("{text}"));
+        let shell = line.rsplit_once('#').unwrap().1.trim_end_matches([')', ';']).to_string();
+        (line.to_string(), shell)
+    };
+    // Torn: its shell loses a face. Lost: its shell is not in the file.
+    let (_, torn) = solid("Torn");
+    let shell = text.lines().find(|l| l.starts_with(&format!("#{torn}="))).unwrap();
+    let (head, faces) = shell.rsplit_once(",#").unwrap();
+    let torn_shell = format!("{head}{}", &faces[faces.find(')').unwrap()..]);
+    let (lost, _) = solid("Lost");
+    let lost_line = format!("{},#999999);", lost.rsplit_once(",#").unwrap().0);
+    let (gone, _) = solid("Gone");
+    let gone_line = format!("{},#999998);", gone.rsplit_once(",#").unwrap().0);
+    let text = text.replacen(shell, &torn_shell, 1).replacen(&lost, &lost_line, 1).replacen(&gone, &gone_line, 1);
+    std::fs::write(&path, &text).unwrap();
+
+    let mut s = Session::default();
+    run(&mut s, "file.insert_step", json!({"path": path.to_string_lossy(), "name": "Imported"}));
+    let names: Vec<String> = s.model.state().bodies.iter().map(|b| b.name.clone()).collect();
+    assert_eq!(names.len(), 2, "{names:?}");
+    let inspect = run(&mut s, "document.inspect", json!({"timeline": false, "bodies": "names"}));
+    let defects = inspect["defects"].as_array().cloned().unwrap_or_default();
+    // A shell short of a face is no solid: the part came in as surfaces.
+    let torn = defects.iter().find(|d| d["body"] == "Torn" && d["kind"] == "imported_as_surfaces");
+    assert!(torn.is_some(), "{defects:#?}");
+    let right = s.doc.components.iter().find(|c| c.name == "Right").unwrap().id;
+    let lost = defects.iter().find(|d| d["component"] == right && d["body"].is_null());
+    assert!(lost.is_some_and(|d| d["kind"] == "not_imported" || d["kind"] == "refused"), "{defects:#?}");
+    // Pin was not made: each component it is placed in is told, not only the first.
+    let left = s.doc.components.iter().find(|c| c.name == "Left").unwrap().id;
+    assert!(!s.doc.components.iter().any(|c| c.name == "Pin"), "{:?}", s.doc.components);
+    for at in [left, right] {
+        assert!(defects.iter().any(|d| d["component"] == at && d["detail"].as_str().is_some_and(|t| t.contains("Gone"))), "{at}: {defects:#?}");
+    }
+    // Kept read cleanly: nothing is said of it.
+    assert!(!defects.iter().any(|d| d["body"] == "Kept"), "{defects:#?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Deleting an inserted assembly keeps the names of the bodies that remain, and leaves no assembly
+/// ownership behind.
+#[test]
+fn step_insert_delete_removes_assembly_and_undo_restores_it() {
+    let dir = std::env::temp_dir().join(format!("solidcraft-step-delete-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("parts.step");
+    let mut source = Session::default();
+    for (name, x) in [("Part", 0), ("Other", 20)] {
+        run(&mut source, "solid.box", json!({"length": 10, "width": 10, "height": 10, "corner": [x, 0, 0], "operation": "new", "body_name": name}));
+    }
+    run(&mut source, "component.from_bodies", json!({"bodies": ["Part", "Other"]}));
+    run(&mut source, "file.export", json!({"path": path.to_string_lossy()}));
+
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 10, "width": 10, "height": 10, "body_name": "Part"}));
+    let kept = s.doc_mut().add_component(Some("Kept"), 0).unwrap();
+    let kept_occurrence = s.doc.occurrence_of(kept).unwrap().clone();
+    run(&mut s, "file.insert_step", json!({"path": path.to_string_lossy(), "name": "Imported"}));
+    let reopened = solidcraft_doc::Document::from_json(&s.doc.to_json()).unwrap();
+    assert!(reopened.find_feature("Imported").unwrap().inserted, "the insert keeps its mark through save");
+    run(&mut s, "solid.mirror", json!({"bodies": ["Part"], "plane": {"origin": [0, 30, 0], "normal": [0, 1, 0]}}));
+    assert!(s.model.state().body("Part (3)").is_some());
+    assert!(!s.doc.assembly.rigid_groups.is_empty());
+    assert!(!s.doc.body_components.is_empty());
+    let before = s.doc.clone();
+    let history = s.undo.len();
+
+    run(&mut s, "timeline.delete", json!({"feature": "Imported"}));
+    assert_eq!(s.undo.len(), history + 1);
+    assert_eq!(s.doc.components.iter().map(|c| c.id).collect::<Vec<_>>(), [kept]);
+    assert_eq!(s.doc.occurrences, [kept_occurrence]);
+    assert!(s.doc.assembly.joints.is_empty() && s.doc.assembly.rigid_groups.is_empty());
+    assert!(s.doc.body_components.is_empty());
+    assert!(s.doc.body_offsets.is_empty());
+    let state = s.model.state();
+    let mirrored = state.body("Part (3)").unwrap();
+    assert_eq!(s.doc.model_body_component(mirrored), 0);
+    run(&mut s, "solid.box", json!({"length": 5, "width": 5, "height": 5, "corner": [40, 0, 0], "operation": "new", "body_name": "Other"}));
+    assert_eq!(s.doc.model_body_component(s.model.state().body("Other").unwrap()), 0);
+    run(&mut s, "edit.undo", json!({}));
+    run(&mut s, "edit.undo", json!({}));
+    assert_eq!(s.doc, before);
+    assert!(s.model.state().body("Part (3)").is_some());
+    run(&mut s, "edit.redo", json!({}));
+    assert!(s.doc.body_components.is_empty());
+    assert!(s.doc.assembly.joints.is_empty());
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// Previews evaluate on a scratch copy: the document, undo history and model are untouched.
+#[test]
+fn preview_has_no_side_effects() {
+    let mut s = Session::default();
+    run(&mut s, "sketch.create", json!({"plane": "XY"}));
+    run(&mut s, "sketch.rectangle.two_point", json!({"p0": [0, 0], "p1": [40, 30]}));
+    run(&mut s, "sketch.finish", json!({}));
+    let doc = s.doc.clone();
+    let (undo, rev) = (s.undo.len(), s.revision);
+    let p = s.preview(&[("solid.extrude".into(), json!({"distance": 15}))]).unwrap();
+    assert!(p.before.bodies.is_empty());
+    assert!(rel(body_volume(&p.after), 40.0 * 30.0 * 15.0) < 1e-9);
+    assert!(Arc::ptr_eq(&doc, &s.doc));
+    assert_eq!((s.undo.len(), s.revision), (undo, rev));
+    assert!(s.model.state().bodies.is_empty());
+    // Errors come back as errors and change nothing either.
+    assert!(s.preview(&[("solid.extrude".into(), json!({"distance": "nonsense"}))]).is_err());
+    assert!(Arc::ptr_eq(&doc, &s.doc));
+
+    // Fillet preview on a real body.
+    run(&mut s, "solid.extrude", json!({"distance": 20}));
+    let (doc, undo) = (s.doc.clone(), s.undo.len());
+    let p = s.preview(&[("solid.fillet".into(), json!({"edges": [[0, 0, 10]], "radius": 3}))]).unwrap();
+    let filleted = 24000.0 - (9.0 - PI * 9.0 / 4.0) * 20.0;
+    assert!(rel(body_volume(&p.after), filleted) < 2e-4);
+    assert!(rel(body_volume(&p.before), 24000.0) < 1e-9);
+    assert!(Arc::ptr_eq(&doc, &s.doc));
+    assert_eq!(s.undo.len(), undo);
+}
+
+/// Previewing an edit shows the rebuilt feature although the timeline is rolled back to it.
+#[test]
+fn preview_of_an_edit() {
+    let mut s = Session::default();
+    run(&mut s, "sketch.create", json!({"plane": "XY"}));
+    run(&mut s, "sketch.rectangle.two_point", json!({"p0": [0, 0], "p1": [40, 30]}));
+    run(&mut s, "sketch.finish", json!({}));
+    let r = run(&mut s, "solid.extrude", json!({"distance": 20}));
+    let fid = r["feature"].as_u64().unwrap();
+    let idx = s.doc.feature_index(fid).unwrap();
+    run(&mut s, "timeline.roll_to", json!({"position": idx}));
+    assert!(s.model.state().bodies.is_empty());
+    let doc = s.doc.clone();
+    let p = s.preview(&[("timeline.redefine".into(), json!({"feature": fid, "command": "solid.extrude", "params": {"distance": 10}}))]).unwrap();
+    assert!(rel(body_volume(&p.after), 12000.0) < 1e-9);
+    assert!(Arc::ptr_eq(&doc, &s.doc));
+}
+
+/// An extrusion too long says so and gives the limit, not `end = 1000000000` (#9625), whether
+/// the distance is typed as text or as a number inside the parameter range.
+#[test]
+fn an_extrude_too_long_says_so() {
+    for distance in [json!("1e9 mm"), json!(5e8), json!("-2e7")] {
+        let mut s = Session::default();
+        run(&mut s, "sketch.create", json!({"plane": "XY"}));
+        run(&mut s, "sketch.rectangle.two_point", json!({"p0": [0, 0], "p1": [30, 20]}));
+        run(&mut s, "sketch.finish", json!({}));
+        let e = s.execute("solid.extrude", &json!({"distance": distance})).err().map(|e| e.to_string()).unwrap_or_default();
+        assert!(
+            e.contains("the extrusion is too long: its end is") && e.contains("past the limit of 10000000 mm") && !e.contains("end ="),
+            "{distance}: {e}"
+        );
+        assert!(s.model.state().bodies.is_empty(), "{distance}");
+    }
+    // The Edit Extrude dialog previews a redefinition of the feature: the same message.
+    let mut s = Session::default();
+    run(&mut s, "sketch.create", json!({"plane": "XY"}));
+    run(&mut s, "sketch.rectangle.two_point", json!({"p0": [0, 0], "p1": [30, 20]}));
+    run(&mut s, "sketch.finish", json!({}));
+    let fid = run(&mut s, "solid.extrude", json!({"distance": 10}))["feature"].as_u64().unwrap();
+    let idx = s.doc.feature_index(fid).unwrap();
+    run(&mut s, "timeline.roll_to", json!({"position": idx}));
+    let redefine = json!({"feature": fid, "command": "solid.extrude", "params": {"distance": "1e9 mm"}});
+    let e = s.preview(&[("timeline.redefine".into(), redefine)]).err().map(|e| e.to_string()).unwrap_or_default();
+    assert!(e.contains("the extrusion is too long: its end is 1000000000 mm from the sketch plane, past the limit of 10000000 mm"), "{e}");
+    // The kernel's limit on a cylinder, a torus or a revolve is not an extrusion's.
+    let mut s = Session::default();
+    let e = s.execute("solid.cylinder", &json!({"radius": 2e7, "height": 10})).err().map(|e| e.to_string()).unwrap_or_default();
+    assert!(!e.is_empty() && !e.contains("extrusion"), "{e}");
+}
+
+/// `operation: "auto"`: into a body cuts; additions default to Join when a solid exists.
+#[test]
+fn extrude_auto_operation() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 40, "width": 30, "height": 20}));
+    // A face pushed in (negative distance) cuts.
+    let p = json!({"face": [20, 15, 20], "distance": -5, "operation": "auto"});
+    assert_eq!(auto_operation(&s, &p).unwrap(), Some("cut"));
+    run(&mut s, "solid.extrude", p);
+    assert!(rel(volume(&mut s), 40.0 * 30.0 * 15.0) < 1e-6);
+    // Pulled out, it joins.
+    assert_eq!(auto_operation(&s, &json!({"face": [20, 15, 15], "distance": 5})).unwrap(), Some("join"));
+    // Pushed in far past the bottom (halfway is below the box), it still cuts (#1257).
+    assert_eq!(auto_operation(&s, &json!({"face": [20, 15, 15], "distance": -50})).unwrap(), Some("cut"));
+    assert_eq!(auto_operation(&s, &json!({"face": [20, 15, 15], "distance": 50, "direction": "negative"})).unwrap(), Some("cut"));
+    // A sketch on XY under the box: up goes into it (cut), down grows out of it (join), and a
+    // profile beside the box still defaults to Join (New Body remains explicit).
+    run(&mut s, "sketch.create", json!({"plane": "XY"}));
+    run(&mut s, "sketch.rectangle.two_point", json!({"p0": [5, 5], "p1": [15, 15]}));
+    run(&mut s, "sketch.rectangle.two_point", json!({"p0": [60, 5], "p1": [70, 15]}));
+    run(&mut s, "sketch.finish", json!({}));
+    let at = |x: f64, d: f64| json!({"profiles": [{"point": [x, 10]}], "distance": d});
+    assert_eq!(auto_operation(&s, &at(10.0, 8.0)).unwrap(), Some("cut"));
+    assert_eq!(auto_operation(&s, &at(10.0, -8.0)).unwrap(), Some("join"));
+    assert_eq!(auto_operation(&s, &at(65.0, 8.0)).unwrap(), Some("join"));
+    run(&mut s, "solid.extrude", json!({"profiles": [{"point": [10, 10]}], "distance": 8, "operation": "auto"}));
+    assert!(rel(volume(&mut s), 40.0 * 30.0 * 15.0 - 100.0 * 8.0) < 1e-6);
+}
+
+/// #467: the automatic operation is decided where the extrude starts. A profile on a plate's top
+/// going down cuts; started From Object at the plate's bottom (or 15 mm lower by a start offset)
+/// the same distance goes out of it, and joins.
+#[test]
+fn extrude_auto_operation_counts_from_the_start() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 40, "width": 30, "height": 10, "corner": [0, 0, 0]}));
+    run(&mut s, "sketch.create", json!({"plane": {"origin": [0, 0, 10], "x_dir": [1, 0, 0], "y_dir": [0, 1, 0]}}));
+    run(&mut s, "sketch.rectangle.two_point", json!({"p0": [5, 5], "p1": [15, 15]}));
+    run(&mut s, "sketch.finish", json!({}));
+    let down = json!({"profiles": [{"point": [10, 10]}], "distance": -5});
+    assert_eq!(auto_operation(&s, &down).unwrap(), Some("cut"));
+    let mut from = down.clone();
+    from["from"] = json!([20, 15, 0]);
+    assert_eq!(auto_operation(&s, &from).unwrap(), Some("join"));
+    let mut offset = down.clone();
+    offset["start_offset"] = json!("-15 mm");
+    assert_eq!(auto_operation(&s, &offset).unwrap(), Some("join"));
+    // Up from the bottom face into the plate it cuts again.
+    let mut up = from.clone();
+    up["distance"] = json!(5);
+    assert_eq!(auto_operation(&s, &up).unwrap(), Some("cut"));
+}
+
+/// #1666: a loft between two 18-point polylines has twisted (bilinear) side faces. Each was
+/// meshed as two flat triangles, which cross the surface; the mesh volume was 16 800.6 mm³
+/// against the B-rep's 17 884. Divided to the chord tolerance, the mesh matches the B-rep.
+#[test]
+fn twisted_ruled_faces_are_meshed_to_the_chord_tolerance() {
+    let mut s = Session::default();
+    run(&mut s, "sketch.create", json!({"plane": "XY", "name": "Bottom"}));
+    run(
+        &mut s,
+        "sketch.line",
+        json!({"closed": true, "infer": false, "connect": false, "points": [[-26,3],[-24.76384,3],[-16.0568,14.97217],[-8,4.90117],[0,14.90117],[8,4.90117],[16.0568,14.97217],[24.76384,3],[26,3],[26,0],[23.23616,0],[15.9432,10.02783],[8,0.09883],[0,10.09883],[-8,0.09883],[-15.9432,10.02783],[-23.23616,0],[-26,0]]}),
+    );
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "sketch.create", json!({"plane": "XY", "offset": 90.5, "name": "Top"}));
+    run(
+        &mut s,
+        "sketch.line",
+        json!({"closed": true, "infer": false, "connect": false, "points": [[-26,3],[-24,3],[-16,3],[-8,3],[0,3],[8,3],[16,3],[24,3],[26,3],[26,0],[24,0],[16,0],[8,0],[0,0],[-8,0],[-16,0],[-24,0],[-26,0]]}),
+    );
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "solid.loft", json!({"sections": [{"sketch": "Bottom"}, {"sketch": "Top"}], "operation": "new"}));
+    let st = s.model.state();
+    let body = &st.bodies.first().unwrap().body;
+    let exact = solidcraft_kernel::measure(body).unwrap().volume;
+    let mesh = body.mesh(&solidcraft_kernel::MeshTolerance::chord(0.05)).unwrap();
+    let volume: f64 = mesh
+        .triangles
+        .iter()
+        .map(|t| {
+            let p = |i: u32| mesh.positions[i as usize];
+            p(t[0]).dot(p(t[1]).cross(p(t[2]))) / 6.0
+        })
+        .sum();
+    assert!(mesh.triangles.len() > 72, "the twisted faces are divided: {} triangles", mesh.triangles.len());
+    assert!(rel(volume.abs(), exact) < 2e-3, "mesh {volume} against B-rep {exact}");
+}
+
+/// #1633: to an object, the extrude goes to it on whichever side it is, whatever its
+/// `direction`: through the body to its far face is a Cut, out to something above is a Join.
+#[test]
+fn extrude_auto_operation_follows_the_to_object() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 40, "width": 30, "height": 20}));
+    run(&mut s, "solid.box", json!({"length": 40, "width": 30, "height": 5, "corner": [0, 0, 50], "body_name": "Above"}));
+    for direction in ["positive", "negative"] {
+        // From the top face to the bottom face: through the body.
+        let down = json!({"face": [20, 15, 20], "to": [10, 10, 0], "distance": 19, "direction": direction});
+        assert!(extrude_reach(&s, &down).is_some_and(|h| (h + 20.0).abs() < 1e-6), "{down}");
+        assert_eq!(auto_operation(&s, &down).unwrap(), Some("cut"), "{down}");
+        // From the top face up to the box above: out of the body.
+        let up = json!({"face": [20, 15, 20], "to": [10, 10, 50], "distance": 19, "direction": direction});
+        assert!(extrude_reach(&s, &up).is_some_and(|h| (h - 30.0).abs() < 1e-6), "{up}");
+        assert_eq!(auto_operation(&s, &up).unwrap(), Some("join"), "{up}");
+    }
+    // Without a To object the direction still counts.
+    assert_eq!(extrude_reach(&s, &json!({"face": [20, 15, 20], "distance": 5, "direction": "negative"})), Some(-5.0));
+}
+
+/// #1678: a hole's `position` takes length expressions, keeps them and follows the parameters: a
+/// hole on a plate's middle line stays there when the plate gets wider. A position of plain
+/// numbers is stored as before, with no `at`.
+#[test]
+fn a_hole_position_of_expressions_follows_the_parameters() {
+    let mut s = Session::default();
+    run(&mut s, "parameters.add", json!({"name": "width", "expression": "30 mm"}));
+    run(&mut s, "parameters.add", json!({"name": "t", "expression": "4 mm"}));
+    run(&mut s, "solid.box", json!({"length": 100, "width": "width", "height": "t", "body_name": "Plate"}));
+    run(&mut s, "solid.hole", json!({"position": ["40", "width/2", "t"], "clearance": "M5", "name": "Middle"}));
+    run(&mut s, "solid.hole", json!({"position": [80, 10, 4], "clearance": "M5", "name": "Fixed"}));
+    let centre_y = |s: &Session| {
+        let st = s.model.state();
+        solidcraft_kernel::measure(&st.body("Plate").unwrap().body).unwrap().centroid.y
+    };
+    let hole = |s: &Session, name: &str| -> Value {
+        let saved: Value = serde_json::from_str(&s.doc.to_json()).unwrap();
+        saved["features"].as_array().and_then(|f| f.iter().find(|f| f["name"] == name)).cloned().unwrap()
+    };
+    assert_eq!(hole(&s, "Middle")["at"], json!([40.0, "width/2", "t"]), "the expressions are kept");
+    assert!(hole(&s, "Fixed").get("at").is_none(), "plain numbers are stored as before");
+    // The fixed hole sits off the middle line, so it alone moves the centre; widen the plate.
+    let before = centre_y(&s);
+    run(&mut s, "parameters.change", json!({"name": "width", "expression": "40 mm"}));
+    let after = centre_y(&s);
+    // The middle hole is at y = 20 now (the plate's middle); the fixed one stays at y = 10. With
+    // the middle hole left at y = 15 the centre would sit lower still.
+    let plate = 100.0 * 40.0 * 4.0;
+    let hole_v = std::f64::consts::PI * (5.5f64 / 2.0).powi(2) * 4.0;
+    let want = (plate * 20.0 - hole_v * 20.0 - hole_v * 10.0) / (plate - 2.0 * hole_v);
+    assert!((after - want).abs() < 1e-3, "centre y {after}, want {want} (was {before})");
+    // A bad expression is refused.
+    assert!(s.execute("solid.hole", &json!({"position": ["40", "nope/2", "t"], "diameter": 3})).is_err());
+}
+
+/// #9088: an unreadable hole direction must not silently drill along the face normal.
+#[test]
+fn hole_direction_rejects_malformed_vectors_without_changing_the_design() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 40, "width": 30, "height": 10, "body_name": "Plate"}));
+    let before = (*s.doc).clone();
+    for direction in [json!("sideways"), json!([0, -1]), json!([0, 0, -1, 0]), json!(["1", "0", "0"]), json!({"x": 1}), json!(false), json!(2)] {
+        let err =
+            s.execute("solid.hole", &json!({"position": [10, 10, 10], "diameter": 5, "depth": 5, "direction": direction})).unwrap_err().to_string();
+        assert!(err.contains("`direction`"), "{direction}: {err}");
+        assert_eq!(*s.doc, before, "{direction} changed the design");
+        assert_eq!(s.model.state().body("Plate").unwrap().body.face_count(), 6);
+        assert!((volume(&mut s) - 12_000.0).abs() < 1e-6);
+    }
+}
+
+/// The default normal and the accepted numeric vector forms still make the same blind hole.
+#[test]
+fn hole_direction_accepts_numeric_vectors_and_the_default() {
+    for direction in [None, Some(Value::Null), Some(json!([0, 0, -2])), Some(json!({"x": 0, "y": 0, "z": -2}))] {
+        let mut s = Session::default();
+        run(&mut s, "solid.box", json!({"length": 40, "width": 30, "height": 10}));
+        let mut params = json!({"position": [10, 10, 10], "diameter": 5, "depth": 5, "name": "Hole"});
+        if let Some(direction) = direction {
+            params["direction"] = direction;
+        }
+        run(&mut s, "solid.hole", params);
+        let hole = run(&mut s, "timeline.inspect", json!({"feature": "Hole"}));
+        assert_eq!(hole["definition"]["direction"], json!([0.0, 0.0, -1.0]));
+        assert!((volume(&mut s) - (12_000.0 - PI * 2.5 * 2.5 * 5.0)).abs() < 1e-6);
+    }
+}
+
+/// Sketch-point holes ignore `direction` unless they use the Single hole mode.
+#[test]
+fn hole_direction_is_checked_for_single_sketch_holes() {
+    for single in [false, true] {
+        let mut s = Session::default();
+        run(&mut s, "solid.box", json!({"length": 40, "width": 30, "height": 10}));
+        run(&mut s, "sketch.create", json!({"plane": "XY", "offset": 10, "name": "Points"}));
+        run(&mut s, "sketch.circle.center", json!({"center": [10, 10], "radius": 2, "id": "c1"}));
+        run(&mut s, "sketch.finish", json!({}));
+        let before = (*s.doc).clone();
+        let result = s.execute(
+            "solid.hole",
+            &json!({"sketch": "Points", "points": ["c1.center"], "single": single, "diameter": 5, "depth": 5, "direction": "sideways"}),
+        );
+        if single {
+            assert!(result.unwrap_err().to_string().contains("`direction`"));
+            assert_eq!(*s.doc, before);
+        } else {
+            result.unwrap();
+            assert!((volume(&mut s) - (12_000.0 - PI * 2.5 * 2.5 * 5.0)).abs() < 1e-6);
+        }
+    }
+}
+
+/// Additive extrusions default to joining even when only a profile side touches material.
+#[test]
+fn auto_extrude_joins_side_contact_elbow_and_keeps_new_body_explicit() {
+    for operation in ["auto", "new"] {
+        let mut s = Session::default();
+        run(&mut s, "solid.box", json!({"length": 10, "width": 10, "height": 30}));
+        run(&mut s, "sketch.create", json!({"plane": {"origin": [10, 0, 0], "x_dir": [0, 1, 0], "y_dir": [0, 0, 1]}}));
+        run(&mut s, "sketch.rectangle.two_point", json!({"p0": [10, 20], "p1": [30, 30]}));
+        run(&mut s, "sketch.finish", json!({}));
+        // The profile centre is outside the vertical arm. Contact is along its
+        // y=10 side, not behind the centre along the extrusion's X direction.
+        let p = json!({"distance": 10, "to": [0, 15, 25], "operation": operation});
+        assert_eq!(auto_operation(&s, &p).unwrap(), Some("join"));
+        run(&mut s, "solid.extrude", p);
+        assert!((volume(&mut s) - 5000.0).abs() < 1e-6);
+        let st = s.model.state();
+        assert_eq!(st.bodies.len(), if operation == "auto" { 1 } else { 2 });
+        if operation == "auto" {
+            let body = &st.bodies.first().unwrap().body;
+            assert!(body.validity().is_empty());
+            assert_eq!(body.lumps().unwrap().len(), 1);
+            assert_eq!(body.face_count(), 8, "the two flat elbow sides must be single faces");
+            assert_eq!(body.classify_point(solidcore_record::Vec3::new(5.0, 10.0, 25.0)).unwrap(), solidcraft_kernel::PointClass::Inside);
+        }
+    }
+}
+
+#[test]
+fn auto_extrude_joins_corner_screw_boss() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 10, "width": 10, "height": 30}));
+    run(&mut s, "sketch.create", json!({"plane": {"origin": [0, 0, 30], "x_dir": [1, 0, 0], "y_dir": [0, 1, 0]}}));
+    run(&mut s, "sketch.circle.center", json!({"center": [10, 10], "radius": 4}));
+    run(&mut s, "sketch.circle.center", json!({"center": [10, 10], "radius": 1}));
+    run(&mut s, "sketch.finish", json!({}));
+    let p = json!({"profiles": [{"point": [12, 10]}], "distance": 5, "operation": "auto"});
+    assert_eq!(auto_operation(&s, &p).unwrap(), Some("join"));
+    run(&mut s, "solid.extrude", p);
+    assert!(rel(volume(&mut s), 3000.0 + PI * 15.0 * 5.0) < 1e-3);
+    let st = s.model.state();
+    assert_eq!(st.bodies.len(), 1);
+    let body = &st.bodies.first().unwrap().body;
+    assert_eq!(body.lumps().unwrap().len(), 1);
+    assert!(body.validity().is_empty());
+    assert_eq!(
+        body.classify_point(solidcore_record::Vec3::new(10.0, 10.0, 32.0)).unwrap(),
+        solidcraft_kernel::PointClass::Outside,
+        "the screw hole stays open"
+    );
+}
+
+#[test]
+fn auto_extrude_starts_new_body_in_empty_component() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 10, "width": 10, "height": 10}));
+    run(&mut s, "component.create", json!({"name": "Other"}));
+    run(&mut s, "sketch.create", json!({"plane": "XY"}));
+    run(&mut s, "sketch.circle.center", json!({"center": [0, 0], "radius": 2}));
+    run(&mut s, "sketch.finish", json!({}));
+    assert_eq!(auto_operation(&s, &json!({"distance": 5})).unwrap(), Some("new"));
+    assert_eq!(auto_operation(&s, &json!({"distance": 5, "participants": ["missing"]})).unwrap(), Some("new"));
+}
+
+/// Measuring picked geometry: distance between faces, angle, edge length.
+#[test]
+fn measure_origin_planes_axes_and_points() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 40, "width": 30, "height": 20}));
+    let at = |p: [f64; 3]| json!({"type": "vertex", "body": "Body1", "point": p});
+    // A point 10 above the XY plane.
+    let r = run(&mut s, "inspect.measure", json!({"items": [{"type": "plane", "name": "XY"}, at([5.0, 5.0, 10.0])]}));
+    assert!((r["distance_mm"].as_f64().unwrap() - 10.0).abs() < 1e-9, "{r}");
+    assert_eq!(r["from"], json!([5.0, 5.0, 0.0]));
+    // The point's distance from the Z axis.
+    let r = run(&mut s, "inspect.measure", json!({"items": [{"type": "axis", "name": "Z"}, at([3.0, 4.0, 7.0])]}));
+    assert!((r["distance_mm"].as_f64().unwrap() - 5.0).abs() < 1e-9, "{r}");
+    // The XY plane and the Z axis meet: nothing between them.
+    let r = run(&mut s, "inspect.measure", json!({"items": [{"type": "plane", "name": "XY"}, {"type": "axis", "name": "Z"}]}));
+    assert!(r["distance_mm"].as_f64().unwrap().abs() < 1e-9, "{r}");
+    // An axis runs on for ever: it meets a plane past the ends of the segment it is drawn as.
+    run(&mut s, "construct.plane.offset", json!({"base": "XY", "offset": 2e6, "name": "Far"}));
+    let r = run(&mut s, "inspect.measure", json!({"items": [{"type": "axis", "name": "Z"}, {"type": "plane", "name": "Far"}]}));
+    assert!(r["distance_mm"].as_f64().unwrap().abs() < 1e-9, "{r}");
+    // An axis parallel to a tilted plane, 5 off it: its ends' heights differ only by rounding,
+    // which is no crossing.
+    for (i, (a, b)) in [(0.3, 0.7), (1.1, -0.45), (0.123, 2.5), (-0.77, 0.31)].into_iter().enumerate() {
+        let k = (1.0f64 + a * a + b * b).sqrt();
+        let n = [-a / k, -b / k, 1.0 / k];
+        let o = [7.0 + 5.0 * n[0], -3.0 + 5.0 * n[1], 10.0 + 7.0 * a - 3.0 * b + 5.0 * n[2]];
+        run(
+            &mut s,
+            "construct.plane.three_points",
+            json!({"a": {"point": [0, 0, 10]}, "b": {"point": [1, 0, 10.0 + a]}, "c": {"point": [0, 1, 10.0 + b]}, "name": format!("Tilt{i}")}),
+        );
+        run(
+            &mut s,
+            "construct.axis.two_points",
+            json!({"a": {"point": o}, "b": {"point": [o[0] + 1.0, o[1] + 2.0, o[2] + a + 2.0 * b]}, "name": format!("Along{i}")}),
+        );
+        let r = run(
+            &mut s,
+            "inspect.measure",
+            json!({"items": [{"type": "axis", "name": format!("Along{i}")}, {"type": "plane", "name": format!("Tilt{i}")}]}),
+        );
+        assert!((r["distance_mm"].as_f64().unwrap() - 5.0).abs() < 1e-6, "tilt {a} {b}: {r}");
+    }
+}
+
+#[test]
+fn measure_items() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 40, "width": 30, "height": 20}));
+    let st = s.model.state();
+    let m = st.body("Body1").unwrap().mesh();
+    // Find the faces by their centroid: top (z = 20), bottom (z = 0), front (y = 0).
+    let face_at = |z: Option<f64>, y: Option<f64>| -> usize {
+        (0..6)
+            .find(|f| {
+                let tris: Vec<_> = m.triangles.iter().zip(&m.tri_face).filter(|(_, tf)| **tf as usize == *f).filter_map(|(t, _)| m.tri(t)).collect();
+                tris.iter().all(|t| t.iter().all(|p| z.is_none_or(|z| (p.z - z).abs() < 1e-9) && y.is_none_or(|y| (p.y - y).abs() < 1e-9)))
+            })
+            .unwrap()
+    };
+    let (ft, fb, ff) = (face_at(Some(20.0), None), face_at(Some(0.0), None), face_at(None, Some(0.0)));
+    let face = |i: usize, p: [f64; 3]| json!({"type": "face", "body": "Body1", "index": i, "point": p});
+    let r = run(&mut s, "inspect.measure", json!({"items": [face(ft, [20.0, 15.0, 20.0]), face(fb, [20.0, 15.0, 0.0])]}));
+    assert!((r["distance_mm"].as_f64().unwrap() - 20.0).abs() < 1e-9, "{r}");
+    assert!((r["angle_deg"].as_f64().unwrap() - 180.0).abs() < 1e-6, "{r}");
+    // The ends of a distance are real points (#11833: NaN ends hid the Distance row): one on
+    // each face, straight across.
+    let end = |k: &str| -> Vec3 { serde_json::from_value(r[k].clone()).unwrap_or_else(|e| panic!("{k}: {e} in {r}")) };
+    let (from, to) = (end("from"), end("to"));
+    assert!((from.z - 20.0).abs() < 1e-9 && to.z.abs() < 1e-9 && (to - from).cross(Vec3::Z).len() < 1e-9, "{r}");
+    let r = run(&mut s, "inspect.measure", json!({"items": [face(ft, [20.0, 15.0, 20.0]), face(ff, [20.0, 0.0, 10.0])]}));
+    assert!(r["distance_mm"].as_f64().unwrap() < 1e-9);
+    assert!((r["angle_deg"].as_f64().unwrap() - 90.0).abs() < 1e-6);
+    for k in ["from", "to"] {
+        assert!(serde_json::from_value::<Vec3>(r[k].clone()).is_ok_and(|p| p.is_finite()), "{k} in {r}");
+    }
+    let r = run(&mut s, "inspect.measure", json!({"items": [face(ft, [20.0, 15.0, 20.0])]}));
+    assert!((r["items"][0]["area_mm2"].as_f64().unwrap() - 1200.0).abs() < 1e-6, "{r}");
+    let v = json!({"type": "vertex", "body": "Body1", "point": [0, 0, 0]});
+    let w = json!({"type": "vertex", "body": "Body1", "point": [40, 30, 20]});
+    let r = run(&mut s, "inspect.measure", json!({"items": [v, w]}));
+    assert!((r["distance_mm"].as_f64().unwrap() - (1600.0f64 + 900.0 + 400.0).sqrt()).abs() < 1e-9);
+    assert!(s.execute("inspect.measure", &json!({"items": []})).is_err());
+    assert!(s.execute("inspect.measure", &json!({"items": [{"type": "nonsense"}]})).is_err());
+}
+
+/// The closest distance between a face and an edge, line or face that ends (#16270, #16271): a
+/// line is not counted as running on to the face's plane, and two faces meet where they cross
+/// or come nearest along an edge, not only at a corner. Values worked out by hand on a
+/// 60 × 40 × 10 block whose top face is z = 10, x from -30 to 30, y from -20 to 20.
+#[test]
+fn measure_closest_between_items_that_end() {
+    let block = |s: &mut Session| {
+        run(s, "solid.box", json!({"length": 60, "width": 40, "height": 10, "corner": [-30, -20, 0], "name": "Block", "body_name": "Block"}));
+    };
+    let top = json!({"type": "face", "body": "Block", "point": [20, 15, 10]});
+    let min = |r: &Value| r["min"].as_f64().unwrap_or(f64::NAN);
+    let at = |r: &Value, k: &str| -> Vec3 { serde_json::from_value(r[k].clone()).unwrap_or_else(|e| panic!("{k}: {e} in {r}")) };
+    // A sketch line on the YZ plane (sketch y is world z): above the face, beside it, past its edge.
+    for (points, want) in [
+        (json!([[10, 25], [10, 50]]), 15.0),
+        (json!([[10, 25], [30, 45]]), 15.0),
+        (json!([[30, 25], [30, 50]]), (10.0f64 * 10.0 + 15.0 * 15.0).sqrt()),
+        (json!([[30, 0], [30, 50]]), 10.0),
+        (json!([[10, 0], [10, 50]]), 0.0),
+        (json!([[-10, 30], [10, 30]]), 20.0),
+    ] {
+        let mut s = Session::default();
+        block(&mut s);
+        run(&mut s, "sketch.create", json!({"plane": "YZ", "name": "Line"}));
+        run(&mut s, "sketch.line", json!({"points": points}));
+        let r = run(&mut s, "inspect.measure", json!({"items": [{"type": "sketch_curve", "sketch": 2, "id": "l1"}, top]}));
+        assert!((min(&r) - want).abs() < 1e-9, "{points}: want {want}, {r}");
+        assert!((at(&r, "from").dist(at(&r, "to")) - want).abs() < 1e-9, "{points}: {r}");
+    }
+    // A body's straight edge 15 above the face: from its lower end straight down.
+    let mut s = Session::default();
+    block(&mut s);
+    run(
+        &mut s,
+        "solid.box",
+        json!({"length": 1, "width": 1, "height": 25, "corner": [0, 10, 25], "operation": "new", "name": "Probe", "body_name": "Probe"}),
+    );
+    let r = run(&mut s, "inspect.measure", json!({"items": [{"type": "edge", "body": "Probe", "point": [0, 10, 40]}, top]}));
+    assert!((min(&r) - 15.0).abs() < 1e-9 && at(&r, "from").dist(Vec3::new(0.0, 10.0, 25.0)) < 1e-9, "{r}");
+    // The side face (x = 1) of a 2 wide fin, against the block's top face.
+    for (width, corner, pick, want) in [
+        (20, [-1, -10, -15], [1, 0, 5], 0.0),
+        (60, [-1, -30, -15], [1, 0, 5], 0.0),
+        (60, [-1, -30, 10], [1, 0, 30], 0.0),
+        (60, [-1, -30, 13], [1, 0, 33], 3.0),
+        (20, [-1, -10, 13], [1, 0, 33], 3.0),
+    ] {
+        let mut s = Session::default();
+        block(&mut s);
+        run(
+            &mut s,
+            "solid.box",
+            json!({"length": 2, "width": width, "height": 40, "corner": corner, "operation": "new", "name": "Fin", "body_name": "Fin"}),
+        );
+        let r = run(&mut s, "inspect.measure", json!({"items": [{"type": "face", "body": "Fin", "point": pick}, top]}));
+        assert!((min(&r) - want).abs() < 1e-9, "fin {width} at {corner:?}: want {want}, {r}");
+        let (from, to) = (at(&r, "from"), at(&r, "to"));
+        assert!((from.x - 1.0).abs() < 1e-9 && (to.z - 10.0).abs() < 1e-9 && to.y.abs() <= 20.0 + 1e-9, "fin {width} at {corner:?}: {r}");
+    }
+}
+
+/// The one plane of the session's section (origin, normal).
+fn only_cut(s: &Session) -> (Vec3, Vec3) {
+    let [c] = s.section[..] else { panic!("one section plane: {:?}", s.section) };
+    (c.origin, c.normal)
+}
+
+/// Section Analysis sets and clears the view cut without touching the design.
+#[test]
+fn section_analysis() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 40, "width": 30, "height": 20}));
+    s.mark_saved();
+    let doc = s.doc.clone();
+    let r = run(&mut s, "inspect.section", json!({"plane": "XZ", "offset": 15}));
+    let (o, n) = only_cut(&s);
+    assert!((o + n * 15.0).len() < 1e-12 && (n.y.abs() - 1.0).abs() < 1e-12);
+    // The cut faces are hatched unless `hatch` says otherwise.
+    assert!(s.section_hatch && r["section"]["hatch"] == true, "{r}");
+    let r = run(&mut s, "inspect.section", json!({"plane": "XZ", "offset": 15, "hatch": false}));
+    assert!(!s.section_hatch && r["section"]["hatch"] == false, "{r}");
+    run(&mut s, "inspect.section", json!({"plane": "XZ", "offset": 15}));
+    assert!(s.section_hatch);
+    run(&mut s, "inspect.section", json!({"plane": {"origin": [0, 0, 5], "normal": [0, 0, 2]}, "flip": true}));
+    let (o, n) = only_cut(&s);
+    assert!((o.z - 5.0).abs() < 1e-12 && (n.z + 1.0).abs() < 1e-12);
+    assert!(s.execute("inspect.section", &json!({"plane": {"normal": [0, 0, 0]}})).is_err());
+    run(&mut s, "inspect.section", json!({"clear": true}));
+    assert!(s.section.is_empty());
+    // XZ's normal is +Y: an offset moves the cut against it, to -Y, `at` places it at a world Y,
+    // and the result says where the cut landed either way.
+    let r = run(&mut s, "inspect.section", json!({"plane": "XZ", "offset": 10}));
+    assert_eq!((r["section"]["axis"].as_str(), r["section"]["at"].as_f64()), (Some("Y"), Some(-10.0)), "{r}");
+    for (plane, at, flip) in [("XZ", -282.5, false), ("XZ", 7.0, true), ("XY", 3.0, false), ("YZ", -4.0, true)] {
+        let r = run(&mut s, "inspect.section", json!({"plane": plane, "at": at, "flip": flip}));
+        assert_eq!(r["section"]["at"].as_f64(), Some(at), "{plane} {r}");
+        let (o, _) = only_cut(&s);
+        assert!(((o.x + o.y + o.z) - at).abs() < 1e-12, "{plane} {o:?}");
+    }
+    assert!(s.execute("inspect.section", &json!({"plane": "XZ", "at": 1, "offset": 1})).is_err());
+    assert!(s.execute("inspect.section", &json!({"plane": {"normal": [0, 1, 0]}, "at": 1})).is_err());
+    run(&mut s, "inspect.section", json!({"clear": true}));
+    assert!(Arc::ptr_eq(&doc, &s.doc) && !s.is_dirty());
+}
+
+/// A section's distance is positive into the part: from a face's outward plane a positive
+/// offset cuts more of the part away, a negative one moves the cut out of it, and Flip keeps the
+/// plane where it is, hiding the other side.
+#[test]
+fn section_distance_is_positive_into_the_part() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 40, "width": 30, "height": 20}));
+    let hidden = |s: &Session, p: Vec3| !s.section.iter().any(|c| c.keeps(p, 0.0));
+    // The top face's outward plane (z 20, normal +Z): 5 mm in, the top 5 mm are cut away.
+    let top = json!({"origin": [20, 15, 20], "normal": [0, 0, 1]});
+    run(&mut s, "inspect.section", json!({"plane": top, "offset": 5}));
+    let (o, n) = only_cut(&s);
+    assert!((o.z - 15.0).abs() < 1e-12 && (n - Vec3::Z).len() < 1e-12, "{o:?} {n:?}");
+    assert!(hidden(&s, Vec3::new(20.0, 15.0, 17.0)) && !hidden(&s, Vec3::new(20.0, 15.0, 13.0)));
+    // Further in cuts more; negative moves the cut out, above the part.
+    run(&mut s, "inspect.section", json!({"plane": top, "offset": 12}));
+    assert!(hidden(&s, Vec3::new(20.0, 15.0, 10.0)));
+    run(&mut s, "inspect.section", json!({"plane": top, "offset": -3}));
+    assert!((only_cut(&s).0.z - 23.0).abs() < 1e-12 && !hidden(&s, Vec3::new(20.0, 15.0, 19.0)));
+    // Flipped, the plane stays 5 mm in and the part below it is hidden.
+    run(&mut s, "inspect.section", json!({"plane": top, "offset": 5, "flip": true}));
+    let (o, n) = only_cut(&s);
+    assert!((o.z - 15.0).abs() < 1e-12 && (n + Vec3::Z).len() < 1e-12, "{o:?} {n:?}");
+    // A named plane: positive cuts more of what its normal points at away (XY hides +Z).
+    run(&mut s, "inspect.section", json!({"plane": "XY", "offset": 4}));
+    assert!((only_cut(&s).0.z + 4.0).abs() < 1e-12 && hidden(&s, Vec3::new(1.0, 1.0, -2.0)));
+    // `at` is a world coordinate either way.
+    let r = run(&mut s, "inspect.section", json!({"plane": "XY", "at": 4}));
+    assert!((only_cut(&s).0.z - 4.0).abs() < 1e-12 && r["section"]["at"] == 4.0, "{r}");
+}
+
+/// Each plane of a section has its own flip: flipping one leaves the others as they are, and a
+/// plane added at a face's outward plane cuts nothing more until it moves in, then cuts the
+/// corner both planes hide.
+#[test]
+fn section_planes_flip_on_their_own() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 40, "width": 30, "height": 20}));
+    let hidden = |s: &Session, p: [f64; 3]| !s.section.iter().any(|c| c.keeps(Vec3::new(p[0], p[1], p[2]), 0.0));
+    // The front face (y 0, outward -Y) 10 mm in, then the end face (x 40, outward +X) added.
+    let front = json!({"origin": [20, 0, 10], "normal": [0, -1, 0]});
+    let end = json!({"origin": [40, 15, 10], "normal": [1, 0, 0]});
+    run(&mut s, "inspect.section", json!({"plane": front, "offset": 10}));
+    let r = run(&mut s, "inspect.section", json!({"plane": end, "add": true}));
+    let id = r["section"]["id"].as_u64().unwrap();
+    assert!(!hidden(&s, [39.0, 5.0, 10.0]), "at the face, the added plane hides nothing of the part");
+    run(&mut s, "inspect.section", json!({"plane": end, "offset": 18, "replace": id}));
+    assert!(hidden(&s, [30.0, 5.0, 10.0]), "the corner both planes hide is cut");
+    assert!(!hidden(&s, [10.0, 5.0, 10.0]) && !hidden(&s, [30.0, 20.0, 10.0]), "nothing else is");
+    let first = s.section[0];
+    run(&mut s, "inspect.section", json!({"plane": end, "offset": 18, "flip": true, "replace": id}));
+    assert_eq!(s.section[0], first, "the first plane keeps its side");
+    assert!((s.section[1].normal + Vec3::X).len() < 1e-12 && (s.section[1].origin.x - 22.0).abs() < 1e-12, "{:?}", s.section[1]);
+    assert!(hidden(&s, [10.0, 5.0, 10.0]) && !hidden(&s, [30.0, 5.0, 10.0]));
+}
+
+/// Every change to a section is one undo step, undone and redone like any other, and none
+/// touches the design or marks it changed.
+#[test]
+fn section_changes_undo_and_redo() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 40, "width": 30, "height": 20}));
+    s.mark_saved();
+    let doc = s.doc.clone();
+    let mut states = vec![s.section_state()];
+    for p in [
+        json!({"plane": "XZ", "offset": -15}),
+        json!({"plane": "YZ", "at": 20, "add": true}),
+        json!({"plane": "YZ", "at": 25, "replace": 2}),
+        json!({"plane": "YZ", "at": 25, "flip": true, "replace": 2}),
+        json!({"hide": 1}),
+        json!({"show": [1]}),
+        json!({"folder": false}),
+        json!({"hide": 2}),
+        json!({"folder": true}),
+        json!({"plane": "XZ", "offset": -15, "hatch": false, "replace": 1}),
+        json!({"remove": 2}),
+        json!({"plane": "XY", "add": true}),
+        json!({"clear": true}),
+    ] {
+        let steps = s.undo.len();
+        run(&mut s, "inspect.section", p.clone());
+        assert_eq!(s.undo.len(), steps + 1, "one step: {p}");
+        assert_eq!(s.undo.last().map(|u| u.label.as_str()), Some("Section Analysis"));
+        states.push(s.section_state());
+    }
+    assert!(states.windows(2).all(|w| w[0] != w[1]), "every step changed the section");
+    for want in states.iter().rev().skip(1) {
+        run(&mut s, "edit.undo", json!({}));
+        assert_eq!(&s.section_state(), want);
+    }
+    for want in states.iter().skip(1) {
+        run(&mut s, "edit.redo", json!({}));
+        assert_eq!(&s.section_state(), want);
+    }
+    assert!(Arc::ptr_eq(&doc, &s.doc) && !s.is_dirty(), "the design is untouched");
+    // A refused change and one that changes nothing take no step.
+    let steps = s.undo.len();
+    assert!(s.execute("inspect.section", &json!({"remove": 7})).is_err());
+    run(&mut s, "inspect.section", json!({"clear": true}));
+    assert_eq!(s.undo.len(), steps);
+    // Undoing a modelling step leaves the section as it is now.
+    run(&mut s, "inspect.section", json!({"plane": "XZ", "offset": -15}));
+    let cut = s.section_state();
+    run(&mut s, "solid.box", json!({"length": 5, "width": 5, "height": 5, "corner": [50, 0, 0]}));
+    run(&mut s, "inspect.section", json!({"hide": 1}));
+    run(&mut s, "edit.undo", json!({}));
+    assert_eq!(s.section_state(), cut);
+    run(&mut s, "edit.undo", json!({}));
+    assert!(Arc::ptr_eq(&doc, &s.doc) && s.section_state() == cut, "the box undone, the section kept");
+    // A checkpoint brings back the section with the history that matches it.
+    let steps = s.undo.len();
+    let id = run(&mut s, "edit.checkpoint", json!({}))["checkpoint"].as_u64().unwrap();
+    run(&mut s, "inspect.section", json!({"plane": "XY", "at": 5, "add": true}));
+    run(&mut s, "inspect.section", json!({"hide": 1}));
+    run(&mut s, "edit.restore_checkpoint", json!({"checkpoint": id}));
+    assert_eq!((s.section_state(), s.undo.len()), (cut.clone(), steps));
+    let id = run(&mut s, "edit.checkpoint", json!({}))["checkpoint"].as_u64().unwrap();
+    run(&mut s, "inspect.section", json!({"clear": true}));
+    run(&mut s, "edit.restore_checkpoint", json!({"checkpoint": id}));
+    assert_eq!(s.section_state(), cut);
+}
+
+/// A section changed while Edit Sketch is open stays undoable once the sketch is finished: the
+/// one Edit Sketch step brings it back, alone or with the sketch's own changes.
+#[test]
+fn a_section_changed_inside_edit_sketch_is_undone_with_its_step() {
+    for drawn in [false, true] {
+        let mut s = Session::default();
+        let sketch = run(&mut s, "sketch.create", json!({"plane": "XY"}))["sketch"].as_u64().unwrap();
+        run(&mut s, "sketch.rectangle.two_point", json!({"p0": [0, 0], "p1": [40, 30]}));
+        run(&mut s, "sketch.finish", json!({}));
+        run(&mut s, "solid.extrude", json!({"distance": 10}));
+        let (doc, before, steps) = (s.doc.to_json(), s.section_state(), s.undo.len());
+        run(&mut s, "sketch.edit", json!({"sketch": sketch, "restore_marker": null}));
+        run(&mut s, "inspect.section", json!({"plane": "XZ", "offset": -15}));
+        if drawn {
+            run(&mut s, "sketch.line", json!({"points": [[0, 40], [10, 40]]}));
+        }
+        run(&mut s, "sketch.finish", json!({}));
+        let cut = s.section_state();
+        assert_ne!(cut, before, "drawn={drawn}");
+        assert_eq!(s.undo.len(), steps + 1, "drawn={drawn}: one Edit Sketch step");
+        run(&mut s, "edit.undo", json!({}));
+        assert_eq!((s.section_state(), s.doc.to_json()), (before, doc), "drawn={drawn}: the section is back");
+        run(&mut s, "edit.redo", json!({}));
+        assert_eq!(s.section_state(), cut, "drawn={drawn}");
+    }
+}
+
+/// A section of several planes: `add` puts a plane beside the others (or starts the section),
+/// `remove` takes one out by its id, the last one turning the section off, and a plane without
+/// `add` replaces them all, as one plane always did. None of it touches the design.
+#[test]
+fn section_analysis_with_several_planes() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 40, "width": 30, "height": 20}));
+    let doc = s.doc.clone();
+    let r = run(&mut s, "inspect.section", json!({"plane": {"origin": [0, 15, 0], "normal": [0, -1, 0]}, "add": true}));
+    assert_eq!((r["section"]["id"].as_u64(), r["planes"].as_array().map(Vec::len)), (Some(1), Some(1)), "{r}");
+    let r = run(&mut s, "inspect.section", json!({"plane": "YZ", "at": 20, "flip": true, "add": true, "hatch": false}));
+    assert_eq!((r["section"]["id"].as_u64(), r["section"]["axis"].as_str(), r["section"]["at"].as_f64()), (Some(2), Some("X"), Some(20.0)), "{r}");
+    assert_eq!(r["planes"][0]["normal"], json!([0.0, -1.0, 0.0]), "{r}");
+    assert_eq!(r["planes"][1]["normal"], json!([-1.0, 0.0, 0.0]), "{r}");
+    assert!(!s.section_hatch, "`hatch` applies to the whole section");
+    // Each plane hides its own side (y < 15, x < 20): a quarter of the box is kept.
+    let kept = |s: &Session, p: Vec3| s.section.iter().all(|c| c.keeps(p, 0.0));
+    assert!(kept(&s, Vec3::new(30.0, 20.0, 10.0)));
+    for p in [Vec3::new(10.0, 5.0, 10.0), Vec3::new(10.0, 20.0, 10.0), Vec3::new(30.0, 5.0, 10.0)] {
+        assert!(!kept(&s, p), "{p:?}");
+    }
+    // Adding keeps the hatch unless it is given.
+    run(&mut s, "inspect.section", json!({"plane": "XY", "at": 18, "add": true}));
+    assert!(!s.section_hatch && s.section.len() == 3);
+    // The same plane twice is refused, and so is a seventh plane.
+    let twice = s.execute("inspect.section", &json!({"plane": "XY", "at": 18, "add": true})).unwrap_err();
+    assert!(twice.to_string().contains("already cuts with this plane"), "{twice}");
+    for z in [1, 2, 3] {
+        run(&mut s, "inspect.section", json!({"plane": {"origin": [0, 0, z], "normal": [0, 0, -1]}, "add": true}));
+    }
+    assert_eq!(s.section.len(), crate::view::MAX_SECTION_PLANES);
+    let full = s.execute("inspect.section", &json!({"plane": "XY", "at": 4, "add": true})).unwrap_err();
+    assert!(full.to_string().contains("at most 6 planes"), "{full}");
+    assert_eq!(s.section.len(), 6);
+    // Removing by id leaves the others, and their ids, as they were.
+    let r = run(&mut s, "inspect.section", json!({"remove": 2}));
+    let ids: Vec<u64> = s.section.iter().map(|c| c.id).collect();
+    assert_eq!(ids, [1, 3, 4, 5, 6]);
+    assert_eq!(r["planes"].as_array().map(Vec::len), Some(5), "{r}");
+    // A new plane takes the id removed, so no two planes share a hatch (plane 7 had plane 1's).
+    let r = run(&mut s, "inspect.section", json!({"plane": "XZ", "at": 9, "add": true}));
+    assert_eq!(r["section"]["id"].as_u64(), Some(2), "a new plane takes the lowest free id: {r}");
+    let ids: Vec<u64> = s.section.iter().map(|c| c.id).collect();
+    assert_eq!(ids, [1, 2, 3, 4, 5, 6]);
+    let hatches: std::collections::BTreeSet<usize> = s.section.iter().map(SectionPlane::hatch).collect();
+    assert_eq!(hatches.len(), 6, "each plane is hatched its own way: {hatches:?}");
+    // Replace moves one plane in place: its id, its place in the list and the others stay.
+    let r = run(&mut s, "inspect.section", json!({"plane": "XZ", "at": 12, "replace": 3}));
+    let ids: Vec<u64> = s.section.iter().map(|c| c.id).collect();
+    assert_eq!((ids, r["section"]["id"].as_u64(), r["section"]["at"].as_f64()), (vec![1, 2, 3, 4, 5, 6], Some(3), Some(12.0)), "{r}");
+    assert!((s.section[2].origin.y - 12.0).abs() < 1e-12 && (s.section[2].normal - Vec3::Y).len() < 1e-12, "{:?}", s.section[2]);
+    assert!(!s.section_hatch, "replacing keeps the hatch unless it is given");
+    let onto = s.execute("inspect.section", &json!({"plane": "XZ", "at": 9, "replace": 3})).unwrap_err();
+    assert!(onto.to_string().contains("already cuts with this plane"), "onto another plane: {onto}");
+    run(&mut s, "inspect.section", json!({"plane": "XZ", "at": 12, "replace": 3}));
+    // A plane without `add` replaces the section, as before.
+    let r = run(&mut s, "inspect.section", json!({"plane": "XZ", "offset": 15}));
+    assert_eq!((s.section.len(), r["section"]["id"].as_u64()), (1, Some(1)), "{r}");
+    assert!(s.section_hatch, "a new section is hatched by default");
+    // Removing the last plane turns the section off.
+    let r = run(&mut s, "inspect.section", json!({"remove": 1}));
+    assert!(s.section.is_empty() && r["section"].is_null() && r["planes"] == json!([]), "{r}");
+    // Clear takes every plane.
+    run(&mut s, "inspect.section", json!({"plane": "XZ", "add": true}));
+    run(&mut s, "inspect.section", json!({"plane": "XY", "add": true}));
+    let r = run(&mut s, "inspect.section", json!({"clear": true}));
+    assert!(s.section.is_empty() && r["section"].is_null(), "{r}");
+    assert!(Arc::ptr_eq(&doc, &s.doc));
+}
+
+/// A plane hidden with its eye stays in the section, cutting nothing, with its id: shown again
+/// it cuts as before, it counts toward the six, and Edit (`replace`) on it shows it moved.
+#[test]
+fn section_planes_hide_and_show() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 40, "width": 30, "height": 20}));
+    run(&mut s, "inspect.section", json!({"plane": "XZ", "at": 15}));
+    run(&mut s, "inspect.section", json!({"plane": "YZ", "at": 20, "add": true}));
+    let both = s.section.clone();
+    let r = run(&mut s, "inspect.section", json!({"hide": 1}));
+    assert_eq!((s.section.iter().map(|c| c.id).collect::<Vec<_>>(), s.section_hidden.iter().map(|c| c.id).collect::<Vec<_>>()), (vec![2], vec![1]));
+    assert_eq!((r["planes"][0]["hidden"].as_bool(), r["planes"][1]["hidden"].as_bool()), (Some(true), Some(false)), "{r}");
+    let r = run(&mut s, "inspect.section", json!({"plane": "XY", "add": true}));
+    assert_eq!(r["section"]["id"].as_u64(), Some(3), "a hidden plane keeps its id: {r}");
+    let twice = s.execute("inspect.section", &json!({"plane": "XZ", "at": 15, "add": true})).unwrap_err();
+    assert!(twice.to_string().contains("already cuts"), "{twice}");
+    run(&mut s, "inspect.section", json!({"remove": 3}));
+    run(&mut s, "inspect.section", json!({"show": 1}));
+    assert!(s.section == both && s.section_hidden.is_empty(), "{:?}", s.section);
+    run(&mut s, "inspect.section", json!({"hide": [1, 2]}));
+    assert!(s.section.is_empty() && s.section_hidden.len() == 2, "every plane hidden: the view is whole");
+    let r = run(&mut s, "inspect.section", json!({"plane": "XZ", "at": 10, "replace": 1}));
+    assert_eq!(r["section"]["id"].as_u64(), Some(1));
+    assert!(s.section.len() == 1 && (s.section[0].origin.y - 10.0).abs() < 1e-12 && s.section_hidden.len() == 1, "moved and shown");
+    for z in [1, 2, 3, 4] {
+        run(&mut s, "inspect.section", json!({"plane": "XY", "at": z, "add": true}));
+    }
+    assert!(s.execute("inspect.section", &json!({"plane": "XY", "at": 5, "add": true})).is_err(), "six, the hidden one included");
+    run(&mut s, "inspect.section", json!({"remove": 2}));
+    assert!(s.section_hidden.is_empty());
+    run(&mut s, "inspect.section", json!({"hide": 1}));
+    run(&mut s, "inspect.section", json!({"plane": "XZ"}));
+    assert!(s.section.len() == 1 && s.section_hidden.is_empty(), "a new section replaces hidden planes too");
+    run(&mut s, "inspect.section", json!({"hide": 1}));
+    run(&mut s, "inspect.section", json!({"clear": true}));
+    assert!(s.section.is_empty() && s.section_hidden.is_empty());
+}
+
+/// The Analysis folder's eye: hiding it hides the planes on show and remembers them; a plane's
+/// own eye meanwhile changes only whether it comes back; showing it, or a plane added or moved,
+/// brings them back.
+#[test]
+fn section_folder_hides_and_shows_its_planes() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 40, "width": 30, "height": 20}));
+    let ids = |v: &[SectionPlane]| v.iter().map(|c| c.id).collect::<Vec<_>>();
+    for p in [json!({"plane": "XZ", "at": 15}), json!({"plane": "YZ", "at": 20, "add": true}), json!({"plane": "XY", "at": 5, "add": true})] {
+        run(&mut s, "inspect.section", p);
+    }
+    run(&mut s, "inspect.section", json!({"hide": 3}));
+    let r = run(&mut s, "inspect.section", json!({"folder": false}));
+    assert_eq!((ids(&s.section), s.section_folder.clone()), (vec![], Some(vec![1, 2])));
+    assert_eq!(r["folder"], json!([1, 2]));
+    run(&mut s, "inspect.section", json!({"hide": 1}));
+    run(&mut s, "inspect.section", json!({"show": 3}));
+    assert_eq!((ids(&s.section), s.section_folder.clone()), (vec![], Some(vec![2, 3])), "only what comes back changes");
+    run(&mut s, "inspect.section", json!({"folder": true}));
+    assert_eq!((ids(&s.section), ids(&s.section_hidden), s.section_folder.clone()), (vec![2, 3], vec![1], None));
+    // A plane added while the folder is hidden shows it, with the planes it hid.
+    run(&mut s, "inspect.section", json!({"folder": false}));
+    run(&mut s, "inspect.section", json!({"plane": "XY", "at": 2, "add": true}));
+    assert_eq!((ids(&s.section), ids(&s.section_hidden), s.section_folder.clone()), (vec![2, 3, 4], vec![1], None));
+    // Undo and redo bring the folder back as it was.
+    run(&mut s, "edit.undo", json!({}));
+    assert_eq!((ids(&s.section), s.section_folder.clone()), (vec![], Some(vec![2, 3])));
+    run(&mut s, "edit.redo", json!({}));
+    assert_eq!(s.section_folder, None);
+    // Removing a plane it hid, or the last plane, forgets it.
+    run(&mut s, "inspect.section", json!({"folder": false}));
+    run(&mut s, "inspect.section", json!({"remove": 2}));
+    assert_eq!(s.section_folder, Some(vec![3, 4]));
+    run(&mut s, "inspect.section", json!({"clear": true}));
+    assert_eq!(s.section_folder, None);
+    assert!(s.execute("inspect.section", &json!({"folder": false, "hide": 1})).is_err());
+    assert!(s.execute("inspect.section", &json!({"folder": "no"})).is_err());
+}
+
+/// Switching linked views restores every section plane, its hidden-folder state and hatch,
+/// without turning a passive paint swap into a model, history or display edit.
+#[test]
+fn inspect_snapshots_keep_independent_multi_plane_sections_without_refreshing_display() {
+    let mut s = Session::default();
+    for params in [
+        json!({"plane": "XZ", "at": 15, "hatch": false}),
+        json!({"plane": "YZ", "at": 20, "add": true}),
+        json!({"plane": "XY", "at": 5, "add": true}),
+        json!({"hide": 3}),
+        json!({"folder": false}),
+    ] {
+        run(&mut s, "inspect.section", params);
+    }
+    s.colored_components = Some(());
+    let hidden_section = s.section_state();
+    assert!(hidden_section.planes.is_empty());
+    assert_eq!(hidden_section.hidden.len(), 3);
+    assert_eq!(hidden_section.folder, Some(vec![1, 2]));
+    assert!(!hidden_section.hatch);
+    let hidden_view = s.inspect();
+
+    for params in [
+        json!({"plane": "XZ", "at": -7, "hatch": true}),
+        json!({"plane": "YZ", "at": 11, "add": true}),
+        json!({"plane": "XY", "at": 2, "add": true}),
+        json!({"hide": 2}),
+    ] {
+        run(&mut s, "inspect.section", params);
+    }
+    s.colored_components = None;
+    let shown_section = s.section_state();
+    assert_eq!((shown_section.planes.len(), shown_section.hidden.len()), (2, 1));
+    assert_eq!(shown_section.folder, None);
+    assert!(shown_section.hatch);
+    let shown_view = s.inspect();
+    let doc = s.doc.clone();
+    let world = s.model.state();
+    let unchanged = (s.revision, s.visibility_revision, s.undo.len(), s.redo.len());
+    for _ in 0..3 {
+        s.set_inspect(hidden_view.clone());
+        assert_eq!(s.section_state(), hidden_section);
+        assert_eq!(s.inspect(), hidden_view);
+        s.set_inspect(shown_view.clone());
+        assert_eq!(s.section_state(), shown_section);
+        assert_eq!(s.inspect(), shown_view);
+        assert!(std::sync::Arc::ptr_eq(&s.doc, &doc));
+        assert!(std::sync::Arc::ptr_eq(&s.model.state(), &world));
+        assert_eq!((s.revision, s.visibility_revision, s.undo.len(), s.redo.len()), unchanged);
+    }
+}
+
+/// Hostile `inspect.section` parameters are refused and leave the section as it was.
+#[test]
+fn section_analysis_refuses_hostile_params() {
+    let mut s = Session::default();
+    run(&mut s, "inspect.section", json!({"plane": "XZ", "offset": 5}));
+    let before = s.section.clone();
+    for p in [
+        json!({"remove": 9}),
+        json!({"remove": -1}),
+        json!({"remove": 1.5}),
+        json!({"remove": "1"}),
+        json!({"remove": 1, "plane": "XY"}),
+        json!({"remove": 1, "add": true}),
+        json!({"plane": "XY", "replace": 9}),
+        json!({"plane": "XY", "replace": -1}),
+        json!({"plane": "XY", "replace": "1"}),
+        json!({"plane": "XY", "replace": 1, "add": true}),
+        json!({"plane": "XY", "replace": 1, "remove": 1}),
+        json!({"replace": 1}),
+        json!({"plane": {"origin": [0, 0, 0], "normal": [1e308, 1e308, 1e308]}, "replace": 1}),
+        json!({"plane": "XY", "add": "yes"}),
+        json!({"plane": "XY", "add": 1}),
+        json!({"plane": {"origin": [0, 0, 0], "normal": [1e308, 1e308, 1e308]}, "add": true}),
+        json!({"plane": {"origin": "here", "normal": [1, 0, 0]}, "add": true}),
+        json!({"plane": {"origin": [0, 0, 0], "normal": [0, 0, 0]}, "add": true}),
+        json!({"plane": null, "add": true}),
+        json!({"add": true}),
+        json!({"plane": [1, 2, 3], "add": true}),
+        json!({"hide": 9}),
+        json!({"hide": [1, 9]}),
+        json!({"hide": "1"}),
+        json!({"hide": -1}),
+        json!({"hide": [1.5]}),
+        json!({"show": {"id": 1}}),
+        json!({"hide": 1, "show": 1}),
+        json!({"hide": 1, "plane": "XY"}),
+        json!({"hide": 1, "add": true}),
+        json!({"show": 1, "remove": 1}),
+        json!({"show": 1, "replace": 1}),
+    ] {
+        assert!(s.execute("inspect.section", &p).is_err(), "{p}");
+        assert_eq!(s.section, before, "{p}");
+    }
+}
+
+/// A section index finds the same cut segments, in the same order and to the bit, as cutting
+/// every triangle: one index for every normal (tilting a Section Analysis turns it every frame,
+/// #10373), axis and tilted, cuts through vertices, at the ends and beyond the part, and a
+/// triangle with a corner that is not a number.
+#[test]
+fn section_index_cuts_like_every_triangle() {
+    let mut s = Session::default();
+    run(&mut s, "solid.cylinder", json!({"radius": 12, "height": 30}));
+    run(&mut s, "solid.box", json!({"length": 40, "width": 30, "height": 8, "operation": "join"}));
+    let st = s.model.state();
+    let m = st.bodies.first().unwrap().mesh();
+    assert!(m.triangles.len() > 64, "enough triangles for several cells: {}", m.triangles.len());
+    let bits = |v: Vec<(Vec3, Vec3)>| v.iter().flat_map(|(a, b)| [a.x, a.y, a.z, b.x, b.y, b.z].map(f64::to_bits)).collect::<Vec<_>>();
+    let mut hostile = (*m).clone();
+    hostile.positions.push(Vec3::new(f64::NAN, 0.0, 0.0));
+    let nan = u32::try_from(hostile.positions.len() - 1).unwrap();
+    hostile.triangles.extend([[0, 1, nan], [0, 1, u32::MAX]]);
+    for m in [&*m, &hostile] {
+        let index = view::SectionIndex::new(m);
+        let mut normals = vec![Vec3::Z, -Vec3::Y, Vec3::new(1.0, 2.0, 3.0).normalized().unwrap(), Vec3::new(-0.3, 0.1, 0.9).normalized().unwrap()];
+        // A tilt drag: the normal turns a little every frame.
+        normals.extend((0..30).map(|k| {
+            let a = (5.0 + 3.0 * k as f64).to_radians();
+            Vec3::new(0.1, a.sin(), a.cos()).normalized().unwrap()
+        }));
+        for n in normals {
+            let heights: Vec<f64> = m.positions.iter().map(|p| n.dot(*p)).filter(|h| h.is_finite()).collect();
+            let (lo, hi) = heights.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), h| (a.min(*h), b.max(*h)));
+            let mut cuts: Vec<f64> = (0..=40).map(|k| lo - 1.0 + (hi - lo + 2.0) * k as f64 / 40.0).collect();
+            cuts.extend(heights.iter().step_by(7).copied());
+            cuts.extend([lo, hi]);
+            for at in cuts {
+                let o = n * at;
+                assert_eq!(bits(index.segments(m, o, n)), bits(view::section_segments(m, o, n)), "{n:?} at {at}");
+            }
+        }
+    }
+}
+
+/// Where two planes' cut faces meet inside the body, the picture draws the line between them,
+/// as wide as the cut outline: along the line the planes cross on, only through the material
+/// and where every other plane keeps it. A third plane shortens it and meets both cuts; planes
+/// crossing outside the body draw none.
+#[test]
+fn section_creases_are_drawn_where_two_cuts_meet() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 40, "width": 30, "height": 20}));
+    run(&mut s, "inspect.section", json!({"plane": {"origin": [0, 15, 0], "normal": [0, -1, 0]}}));
+    run(&mut s, "inspect.section", json!({"plane": {"origin": [20, 0, 0], "normal": [1, 0, 0]}, "add": true}));
+    // How much of the cut-width lines lies along `a`-`b`.
+    let along = |s: &Session, a: Vec3, b: Vec3| -> f64 {
+        let cam = view::home_camera(s).unwrap();
+        let near = |p: Vec3| p.dist_to_segment(a, b) < 0.02;
+        let lines = view::scene_with_section(s, &cam, &s.section).unwrap().lines;
+        let on: Vec<&[Vec3]> = lines.iter().filter(|l| l.width == 1.6 && l.points.iter().all(|p| near(*p))).map(|l| &l.points[..]).collect();
+        on.iter().flat_map(|p| p.windows(2)).map(|w| w[0].dist(w[1])).sum()
+    };
+    let v = |x: f64, y: f64, z: f64| Vec3::new(x, y, z);
+    assert!((along(&s, v(20.0, 15.0, 0.0), v(20.0, 15.0, 20.0)) - 20.0).abs() < 0.05, "the two cuts' shared edge");
+    run(&mut s, "inspect.section", json!({"plane": {"origin": [0, 0, 14], "normal": [0, 0, 1]}, "add": true}));
+    for (a, b, length) in [
+        (v(20.0, 15.0, 0.0), v(20.0, 15.0, 20.0), 14.0),
+        (v(-5.0, 15.0, 14.0), v(25.0, 15.0, 14.0), 20.0),
+        (v(20.0, 10.0, 14.0), v(20.0, 35.0, 14.0), 15.0),
+    ] {
+        let drawn = along(&s, a, b);
+        assert!((drawn - length).abs() < 0.05, "{a:?} to {b:?}: {drawn} mm drawn, {length} mm wanted");
+    }
+    run(&mut s, "inspect.section", json!({"plane": {"origin": [0, -5, 0], "normal": [0, -1, 0]}}));
+    run(&mut s, "inspect.section", json!({"plane": {"origin": [20, 0, 0], "normal": [1, 0, 0]}, "add": true}));
+    assert_eq!(along(&s, v(20.0, -5.0, -10.0), v(20.0, -5.0, 30.0)), 0.0, "no crease outside the body");
+    // Parallel planes have no line in common.
+    let parallel = [Vec3::X, -Vec3::X].map(|normal| SectionPlane { id: 1, origin: Vec3::new(20.0, 0.0, 0.0), normal });
+    let segments = view::section_segments(&s.model.state().bodies[0].mesh(), parallel[0].origin, parallel[0].normal);
+    assert!(view::section_creases(&segments, &parallel, 0, 1e-3).is_empty());
+}
+
+/// Press Pull: positive pulls a face out, negative pushes it in (a cut), edges get a fillet.
+#[test]
+fn press_pull() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 40, "width": 30, "height": 20}));
+    run(&mut s, "solid.press_pull", json!({"face": [20, 15, 20], "distance": 5}));
+    assert!(rel(volume(&mut s), 40.0 * 30.0 * 25.0) < 1e-6);
+    run(&mut s, "solid.press_pull", json!({"face": [20, 15, 25], "distance": "-10"}));
+    assert!(rel(volume(&mut s), 40.0 * 30.0 * 15.0) < 1e-6);
+    assert!(s.execute("solid.press_pull", &json!({"face": [20, 15, 15], "distance": 0})).is_err());
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 40, "width": 30, "height": 20}));
+    run(&mut s, "solid.press_pull", json!({"edges": [[0, 0, 7]], "distance": 3}));
+    assert!(rel(volume(&mut s), 24000.0 - (9.0 - PI * 9.0 / 4.0) * 20.0) < 2e-4);
+}
+
+/// Extruding a planar body face (press-pull style): the face boundary becomes a sketch profile.
+#[test]
+fn extrude_a_body_face() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 40, "width": 30, "height": 20}));
+    run(&mut s, "solid.extrude", json!({"face": [20, 15, 20], "distance": 15, "operation": "join"}));
+    assert!(rel(volume(&mut s), 40.0 * 30.0 * 35.0) < 1e-6);
+    assert!(s.active_sketch.is_none());
+    // A face with a round hole: the hole stays open (a new body: joins of curved bodies on a
+    // shared face are a kernel gap for now).
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 40, "width": 30, "height": 20}));
+    run(&mut s, "sketch.create", json!({"plane": "XY"}));
+    run(&mut s, "sketch.circle.center", json!({"center": [20, 15], "radius": 5}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "solid.extrude", json!({"distance": 20, "operation": "cut"}));
+    let before = volume(&mut s);
+    run(&mut s, "solid.extrude", json!({"face": [5, 5, 20], "distance": 10, "operation": "new"}));
+    let v = volume(&mut s);
+    assert!(rel(v - before, (1200.0 - PI * 25.0) * 10.0) < 1e-3, "{v} {before}");
+    assert!(s.execute("solid.extrude", &json!({"face": [500, 5, 20], "distance": 10})).is_err());
+}
+
+/// Export 3MF; open and insert it as mesh bodies; mesh bodies move and export but refuse
+/// solid features.
+#[test]
+fn threemf_export_open_insert() {
+    let dir = std::env::temp_dir().join(format!("solidcraft-3mf-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 40, "width": 30, "height": 20}));
+    run(&mut s, "solid.cylinder", json!({"radius": 5, "height": 10, "base": [100, 0, 0]}));
+    let p = dir.join("Parts.3MF");
+    run(&mut s, "file.export", json!({"path": p.to_string_lossy()}));
+    let want = volume(&mut s);
+    // With face tags it is still a 3MF any reader opens, with the same bodies.
+    let tagged = dir.join("tagged.3mf");
+    let r = run(&mut s, "file.export", json!({"path": tagged.to_string_lossy(), "format": "3mf-tagged"}));
+    assert_eq!(r["format"], "ThreeMfTagged", "{r}");
+    let mut t = Session::default();
+    let r = run(&mut t, "doc.open", json!({"path": tagged.to_string_lossy()}));
+    assert_eq!(r["bodies"].as_array().unwrap().len(), 2, "{r}");
+    assert!(rel(volume(&mut t), want) < 2e-3, "{} vs {want}", volume(&mut t));
+
+    let mut m = Session::default();
+    let r = run(&mut m, "doc.open", json!({"path": p.to_string_lossy()}));
+    assert_eq!(r["bodies"].as_array().unwrap().len(), 2, "{r}");
+    assert_eq!(m.doc.features[0].kind.type_name(), "MeshFeature");
+    assert!(rel(volume(&mut m), want) < 2e-3, "{} vs {want}", volume(&mut m));
+    let meas = run(&mut m, "inspect.measure", json!({}));
+    assert!(meas["bodies"][0]["face_types"]["mesh"].as_u64().unwrap() >= 12, "{meas}");
+    let e = m.execute("solid.fillet", &json!({"edges": [[0, 0, 10]], "radius": 2})).unwrap_err().to_string();
+    assert!(e.contains("mesh"), "{e}");
+    assert!(m.execute("file.export", &json!({"path": dir.join("x.step").to_string_lossy()})).is_err());
+    let stl = dir.join("again.stl");
+    run(&mut m, "file.export", json!({"path": stl.to_string_lossy()}));
+
+    // Insert the STL into the solid design; names stay unique.
+    run(&mut s, "file.insert_mesh", json!({"path": stl.to_string_lossy()}));
+    assert_eq!(s.model.state().bodies.len(), 3);
+    assert!(rel(volume(&mut s), 2.0 * want) < 2e-3);
+    assert!(s.execute("file.insert_mesh", &json!({"path": dir.join("x.step").to_string_lossy()})).is_err());
+    // An STL's unit scales it to millimetres as it is read: inches are 25.4 mm each. 3MF states its own.
+    let mut inch = Session::default();
+    let r = run(&mut inch, "file.insert_mesh", json!({"path": stl.to_string_lossy(), "units": "in"}));
+    assert_eq!(r["units"], "in", "{r}");
+    assert!(rel(volume(&mut inch), want * 25.4f64.powi(3)) < 2e-3);
+    for bad_units in [json!("furlong"), json!(7), json!("")] {
+        assert!(inch.execute("file.insert_mesh", &json!({"path": stl.to_string_lossy(), "units": bad_units})).is_err());
+    }
+    assert!(inch.execute("file.insert_mesh", &json!({"path": p.to_string_lossy(), "units": "in"})).is_err());
+    let junk = dir.join("junk.3mf");
+    std::fs::write(&junk, b"PK\x03\x04 not really").unwrap();
+    let before = s.doc.clone();
+    assert!(s.execute("file.insert_mesh", &json!({"path": junk.to_string_lossy()})).is_err());
+    assert!(s.execute("doc.open", &json!({"path": junk.to_string_lossy()})).is_err());
+    assert_eq!(*s.doc, *before);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A cube one unit across comes in as that unit in millimetres, for every unit: the sizes are
+/// written out here, not read from the table that scales the file.
+#[test]
+fn stl_cube_of_one_unit_comes_in_as_that_many_millimetres() {
+    let dir = std::env::temp_dir().join(format!("solidcraft-stl-units-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let stl = dir.join("one.stl");
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 1, "width": 1, "height": 1}));
+    run(&mut s, "file.save_mesh", json!({"path": stl.to_string_lossy()}));
+    for (units, edge) in [("mm", 1.0_f64), ("cm", 10.0), ("m", 1000.0), ("in", 25.4), ("ft", 304.8)] {
+        let mut t = Session::default();
+        let r = run(&mut t, "file.insert_mesh", json!({"path": stl.to_string_lossy(), "units": units}));
+        assert_eq!(r["units"], units, "{r}");
+        let solidcraft_doc::FeatureKind::MeshImport { meshes, .. } = &t.doc.features[0].kind else { panic!("{units}: not a mesh import") };
+        for axis in 0..3 {
+            let along: Vec<f64> = meshes[0].positions.chunks(3).map(|p| p[axis]).collect();
+            let (lo, hi) = (along.iter().cloned().fold(f64::MAX, f64::min), along.iter().cloned().fold(f64::MIN, f64::max));
+            assert!(((hi - lo) - edge).abs() <= edge * 1e-12, "{units}: edge {} along axis {axis}, want {edge}", hi - lo);
+        }
+        assert!(rel(volume(&mut t), edge.powi(3)) < 1e-9, "{units}: volume {}", volume(&mut t));
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A unit given on import and a Scale feature after an import in millimetres make the same body,
+/// within floating-point precision, for each unitless mesh format: STL, OBJ and PLY (with faces).
+#[test]
+fn a_unit_on_import_matches_importing_in_millimetres_then_scaling() {
+    let dir = std::env::temp_dir().join(format!("solidcraft-unit-vs-scale-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    // A cube one unit across, as the three formats write it.
+    let corners = [[0, 0, 0], [1, 0, 0], [1, 1, 0], [0, 1, 0], [0, 0, 1], [1, 0, 1], [1, 1, 1], [0, 1, 1]];
+    let triangles =
+        [[0, 2, 1], [0, 3, 2], [4, 5, 6], [4, 6, 7], [0, 1, 5], [0, 5, 4], [3, 7, 6], [3, 6, 2], [0, 4, 7], [0, 7, 3], [1, 2, 6], [1, 6, 5]];
+    let vertex = |i: usize| format!("{} {} {}", corners[i][0], corners[i][1], corners[i][2]);
+    let mut stl = String::from("solid cube\n");
+    for t in triangles {
+        stl += "facet normal 0 0 0\nouter loop\n";
+        for i in t {
+            stl += &format!("vertex {}\n", vertex(i));
+        }
+        stl += "endloop\nendfacet\n";
+    }
+    stl += "endsolid cube\n";
+    let mut obj = String::from("o Cube\n");
+    for i in 0..8 {
+        obj += &format!("v {}\n", vertex(i));
+    }
+    for t in triangles {
+        obj += &format!("f {} {} {}\n", t[0] + 1, t[1] + 1, t[2] + 1);
+    }
+    let mut ply = String::from("ply\nformat ascii 1.0\nelement vertex 8\nproperty float x\nproperty float y\nproperty float z\n");
+    ply += "element face 12\nproperty list uchar int vertex_indices\nend_header\n";
+    for i in 0..8 {
+        ply += &format!("{}\n", vertex(i));
+    }
+    for t in triangles {
+        ply += &format!("3 {} {} {}\n", t[0], t[1], t[2]);
+    }
+    let close = |a: f64, b: f64| (a - b).abs() <= 1e-9 * b.abs().max(1.0);
+    for (extension, text) in [("stl", stl), ("obj", obj), ("ply", ply)] {
+        let path = dir.join(format!("cube.{extension}"));
+        std::fs::write(&path, text).unwrap();
+        for (units, mm) in [("mm", 1.0_f64), ("cm", 10.0), ("m", 1000.0), ("in", 25.4), ("ft", 304.8)] {
+            let mut with_unit = Session::default();
+            run(&mut with_unit, "file.insert_mesh", json!({"path": path.to_string_lossy(), "units": units}));
+            let mut scaled = Session::default();
+            let inserted = run(&mut scaled, "file.insert_mesh", json!({"path": path.to_string_lossy()}));
+            let body = inserted["bodies"][0].as_str().unwrap().to_string();
+            run(&mut scaled, "solid.scale", json!({"bodies": [body], "factor": mm.to_string()}));
+            let (a, b) = (with_unit.model.state().bodies[0].mesh().bounds(), scaled.model.state().bodies[0].mesh().bounds());
+            let (a, b) = ([a.min.x, a.min.y, a.min.z, a.max.x, a.max.y, a.max.z], [b.min.x, b.min.y, b.min.z, b.max.x, b.max.y, b.max.z]);
+            for (x, y) in a.into_iter().zip(b) {
+                assert!(close(x, y), "{extension} {units}: bounds {a:?} against {b:?}");
+            }
+            let (va, vb) = (volume(&mut with_unit), volume(&mut scaled));
+            assert!(rel(va, vb) < 1e-9, "{extension} {units}: volume {va} against {vb}");
+            assert!(rel(va, mm.powi(3)) < 1e-9, "{extension} {units}: volume {va}, want {}", mm.powi(3));
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn holes_at_sketch_points_threads_and_components() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 60, "width": 40, "height": 10, "name": "Plate"}));
+    run(&mut s, "sketch.create", json!({"plane": {"face": [30, 20, 10]}, "name": "HolePoints"}));
+    let mut ids = Vec::new();
+    for (k, (x, y)) in [(10.0, 10.0), (50.0, 10.0), (50.0, 30.0), (10.0, 30.0)].into_iter().enumerate() {
+        let id = format!("h{k}");
+        run(&mut s, "sketch.point", json!({ "point": [x, y], "id": id }));
+        ids.push(id);
+    }
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "solid.hole", json!({"sketch": "HolePoints", "points": ids, "diameter": 5, "thread": "M6", "name": "Holes"}));
+    let v = volume(&mut s);
+    assert!(rel(v, 60.0 * 40.0 * 10.0 - 4.0 * PI * 6.25 * 10.0) < 1e-3, "{v}");
+    let t = run(&mut s, "model.threads", json!({}));
+    let threads = t["threads"].as_array().unwrap();
+    assert_eq!(threads.len(), 4, "{t}");
+    assert_eq!(threads[0]["designation"], "M6");
+    assert_eq!(threads[0]["internal"], true);
+    // A cosmetic thread on a shaft; designation from its size.
+    run(&mut s, "solid.cylinder", json!({"base": [100, 0, 0], "radius": 4, "height": 20, "name": "Shaft", "body_name": "Shaft"}));
+    let th = run(&mut s, "solid.thread", json!({"face": [104, 0, 10], "length": 12, "from": [100, 0, 0]}));
+    assert_eq!(th["thread"]["designation"], "M8", "{th}");
+    assert!((th["thread"]["end"].as_f64().unwrap() - th["thread"]["start"].as_f64().unwrap() - 12.0).abs() < 1e-6, "{th}");
+    assert!(s.execute("solid.thread", &json!({"face": [104, 0, 10], "designation": "M20"})).is_err());
+    // Components: features made while one is active belong to it.
+    let c = run(&mut s, "component.create", json!({"name": "Bracket"}));
+    let cid = c["component"].as_u64().unwrap();
+    run(&mut s, "solid.box", json!({"corner": [0, 60, 0], "length": 10, "width": 10, "height": 10, "name": "Block"}));
+    run(&mut s, "component.activate", json!({"component": "root"}));
+    let l = run(&mut s, "component.list", json!({}));
+    let comps = l["components"].as_array().unwrap();
+    let bracket = comps.iter().find(|x| x["id"] == cid).unwrap();
+    assert_eq!(bracket["features"], json!(["Block"]), "{l}");
+    assert_eq!(bracket["bodies"].as_array().map(|a| a.len()), Some(1), "{l}");
+    let r = run(&mut s, "component.from_bodies", json!({"bodies": ["Shaft"]}));
+    assert_eq!(r["components"].as_array().map(|a| a.len()), Some(1));
+    // Saved and loaded with the components.
+    let text = s.doc.to_json();
+    let back = solidcraft_doc::Document::from_json(&text).unwrap();
+    assert_eq!(back.components.len(), 2);
+    let assigned = r["components"][0]["component"].as_u64().unwrap();
+    let transfer = r["components"][0]["feature"].as_u64().unwrap();
+    assert!(
+        matches!(&back.feature(transfer).unwrap().kind, solidcraft_doc::FeatureKind::BodyTransfer { bodies, to, .. } if bodies == &["Shaft"] && *to == assigned)
+    );
+    let reopened = Session::new(back);
+    assert_eq!(reopened.model.state().body("Shaft").unwrap().component, assigned);
+    assert_eq!(reopened.world_state().unwrap().threads.len(), s.world_state().unwrap().threads.len());
+}
+
+#[test]
+fn pipe_scale_offset_bounding_and_materials() {
+    let mut s = Session::default();
+    // Pipe along an L path (line, arc, line) on XZ.
+    run(&mut s, "sketch.create", json!({"plane": "XY", "name": "Path"}));
+    run(&mut s, "sketch.line", json!({"points": [[0, 0], [30, 0]], "ids": ["l1"]}));
+    run(&mut s, "sketch.arc.center_point", json!({"center": [30, 10], "start": "l1.end", "end": [40, 10], "id": "a1"}));
+    run(&mut s, "sketch.line", json!({"points": ["a1.end", [40, 40]], "ids": ["l2"]}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "solid.pipe", json!({"path_sketch": "Path", "path": ["l1", "a1", "l2"], "diameter": 4, "wall": 1, "body_name": "Tube"}));
+    let len = 30.0 + PI * 10.0 / 2.0 + 30.0;
+    let v = volume(&mut s);
+    assert!(rel(v, PI * (4.0 - 1.0) * len) < 2e-3, "{v} vs {}", PI * 3.0 * len);
+    // Bounding solid around it; then scale a box and push one of its faces.
+    run(&mut s, "solid.bounding_solid", json!({"bodies": ["Tube"], "margin": 1, "body_name": "Stock"}));
+    let m = run(&mut s, "inspect.measure", json!({"bodies": ["Stock"]}));
+    let bb = &m["bodies"][0]["bbox"];
+    assert!((bb["min"][1].as_f64().unwrap() + 3.0).abs() < 1e-6 && (bb["max"][1].as_f64().unwrap() - 41.0).abs() < 1e-6, "{bb}");
+    // A margin per side (#17043): none at the bottom, more on top, one side set into the tube.
+    let tube = run(&mut s, "inspect.measure", json!({"bodies": ["Tube"]}))["bodies"][0]["bbox"].clone();
+    let at = |b: &Value, end: &str, axis: usize| b[end][axis].as_f64().unwrap();
+    run(&mut s, "solid.bounding_solid", json!({"bodies": ["Tube"], "margin": 9, "margins": [1, 2, "-1 mm", 3, 0, "2 * 2"], "body_name": "Sided"}));
+    let sided = run(&mut s, "inspect.measure", json!({"bodies": ["Sided"]}))["bodies"][0]["bbox"].clone();
+    for (axis, lo, hi) in [(0, 1.0, 2.0), (1, -1.0, 3.0), (2, 0.0, 4.0)] {
+        assert!((at(&tube, "min", axis) - lo - at(&sided, "min", axis)).abs() < 1e-6, "{axis}: {sided} around {tube}");
+        assert!((at(&tube, "max", axis) + hi - at(&sided, "max", axis)).abs() < 1e-6, "{axis}: {sided} around {tube}");
+    }
+    let features = s.doc.features.len();
+    for margins in [json!([1, 2, 3]), json!([0, 0, 0, 0, -50, -50])] {
+        let refused = s.execute("solid.bounding_solid", &json!({"bodies": ["Tube"], "margins": margins}));
+        assert!(refused.is_err() || s.model.results.last().is_some_and(|r| r.error.is_some()), "{margins}: {refused:?}");
+        if refused.is_ok() {
+            run(&mut s, "edit.undo", json!({}));
+        }
+    }
+    assert_eq!(s.doc.features.len(), features);
+    run(&mut s, "solid.box", json!({"corner": [100, 0, 0], "length": 10, "width": 10, "height": 10, "body_name": "Cube"}));
+    run(&mut s, "solid.scale", json!({"bodies": ["Cube"], "factor": 2, "origin": [100, 0, 0]}));
+    let vc = run(&mut s, "inspect.measure", json!({"bodies": ["Cube"]}))["total"]["volume_mm3"].as_f64().unwrap();
+    assert!(rel(vc, 8000.0) < 1e-9, "{vc}");
+    run(&mut s, "solid.offset_face", json!({"faces": [[110, 10, 20]], "distance": 5}));
+    let vc = run(&mut s, "inspect.measure", json!({"bodies": ["Cube"]}))["total"]["volume_mm3"].as_f64().unwrap();
+    assert!(rel(vc, 20.0 * 20.0 * 25.0) < 1e-9, "{vc}");
+    // Materials and mass.
+    run(&mut s, "material.assign", json!({"bodies": ["Cube"], "material": "aluminum"}));
+    let m = run(&mut s, "inspect.measure", json!({"bodies": ["Cube"]}));
+    assert!((m["bodies"][0]["mass_g"].as_f64().unwrap() - 10_000.0 * 2.7 / 1000.0).abs() < 1e-6, "{m}");
+    assert_eq!(m["bodies"][0]["material"], "Aluminum");
+    assert!(s.execute("material.assign", &json!({"bodies": ["Cube"], "material": "unobtainium"})).is_err());
+}
+
+/// A Bounding Solid of listed bodies (no `contents`), as every saved design has it, keeps the box
+/// it always built: around the bodies' display meshes, not their exact bounds, so a design saved
+/// before component envelopes rebuilds at the same size.
+#[test]
+fn a_bounding_solid_without_contents_keeps_its_mesh_bound_size() {
+    let mut s = Session::default();
+    run(&mut s, "solid.cylinder", json!({"radius": 10, "height": 10, "body_name": "Rod"}));
+    // Turned 7 degrees about Z, the rim's mesh points no longer reach the exact circle's extremes.
+    run(&mut s, "solid.move", json!({"bodies": ["Rod"], "axis": [0, 0, 1], "angle": "7 deg"}));
+    let st = s.model.state();
+    let rod = st.body("Rod").unwrap();
+    let (mesh, exact) = (rod.mesh().bounds(), rod.body.exact_bounds().unwrap());
+    drop(st);
+    assert!((exact.max.x - mesh.max.x).abs() > 1e-6 || (exact.max.y - mesh.max.y).abs() > 1e-6, "{mesh:?} vs {exact:?}");
+    run(&mut s, "solid.bounding_solid", json!({"bodies": ["Rod"], "margin": 1, "body_name": "Stock"}));
+    let stock = s.model.state().body("Stock").unwrap().body.exact_bounds().unwrap();
+    for (got, want) in
+        [(stock.min.x, mesh.min.x - 1.0), (stock.min.y, mesh.min.y - 1.0), (stock.max.x, mesh.max.x + 1.0), (stock.max.y, mesh.max.y + 1.0)]
+    {
+        assert!((got - want).abs() < 1e-9, "{stock:?} around mesh {mesh:?}");
+    }
+}
+
+/// A component's envelope (`solid.bounding_solid` with `component`) bounds every body placed inside
+/// it, its subcomponents' and each placement of a part placed twice, in its own frame: it moves
+/// with the component and is built again when a part inside it moves.
+#[test]
+fn a_components_envelope_bounds_its_parts_where_they_are_placed() {
+    let mut s = Session::default();
+    let bought = run(&mut s, "component.create", json!({"name": "Bought", "grounded": false}))["component"].as_u64().unwrap();
+    run(&mut s, "solid.box", json!({"corner": [0, 0, 0], "length": 10, "width": 10, "height": 10, "body_name": "Plate"}));
+    let pin = run(&mut s, "component.create", json!({"name": "Pin"}))["component"].as_u64().unwrap();
+    run(&mut s, "solid.box", json!({"corner": [0, 0, 10], "length": 2, "width": 2, "height": 4, "body_name": "Peg"}));
+    // The pin placed again 20 mm along X: only an occurrence, no body of its own in the model.
+    let copy = run(&mut s, "occurrence.copy", json!({"component": pin, "translate": [20, 0, 0]}))["occurrence"].as_u64().unwrap();
+    run(&mut s, "component.activate", json!({"component": "root"}));
+    let bounds = |s: &mut Session| {
+        let m = run(s, "inspect.measure", json!({"bodies": ["Bought Envelope"]}));
+        let bb = &m["bodies"][0]["bbox"];
+        let v = |k: &str, i: usize| bb[k][i].as_f64().unwrap();
+        [v("min", 0), v("min", 1), v("min", 2), v("max", 0), v("max", 1), v("max", 2)]
+    };
+    let close = |a: [f64; 6], b: [f64; 6]| a.iter().zip(&b).all(|(x, y)| (x - y).abs() < 1e-9);
+    let out = run(&mut s, "solid.bounding_solid", json!({"component": "Bought", "body_name": "Bought Envelope"}));
+    assert_eq!(out["created_bodies"], json!(["Bought Envelope"]), "{out}");
+    let f = s.doc.features.last().unwrap();
+    assert!(matches!(f.kind, solidcraft_doc::FeatureKind::BoundingSolid { contents: true, .. }) && f.component == bought);
+    assert!(s.active_component == 0, "the active component is left as it was");
+    let b = bounds(&mut s);
+    assert!(close(b, [0.0, 0.0, 0.0, 22.0, 10.0, 14.0]), "{b:?}");
+    // The whole component moves: the envelope goes with it.
+    let occurrence = s.doc.occurrence_of(bought).unwrap().id;
+    run(&mut s, "occurrence.move", json!({"occurrence": occurrence, "translate": [100, 0, 0]}));
+    let b = bounds(&mut s);
+    assert!(close(b, [100.0, 0.0, 0.0, 122.0, 10.0, 14.0]), "{b:?}");
+    // A part inside it moves: the envelope is built again around where it now stands.
+    run(&mut s, "occurrence.move", json!({"occurrence": copy, "translate": [5, 0, 3]}));
+    let b = bounds(&mut s);
+    assert!(close(b, [100.0, 0.0, 0.0, 127.0, 10.0, 17.0]), "{b:?}");
+    // It survives saving and opening, and `bodies` with `component` is refused.
+    let back = solidcraft_doc::Document::from_json(&s.doc.to_json()).unwrap();
+    assert!(matches!(back.features.last().unwrap().kind, solidcraft_doc::FeatureKind::BoundingSolid { contents: true, .. }));
+    assert!(Session::new(back).model.state().body("Bought Envelope").is_some());
+    let e = s.execute("solid.bounding_solid", &json!({"component": "Bought", "bodies": ["Plate"]})).unwrap_err().to_string();
+    assert!(e.contains("not both"), "{e}");
+    // A second envelope of the same component is refused: each would stand in for the other.
+    let e = s.execute("solid.bounding_solid", &json!({"component": "Bought"})).unwrap_err().to_string();
+    assert!(e.contains("already has an envelope"), "{e}");
+    // A feature of the component that names no bodies works on its parts, never on its envelope.
+    let volume = |s: &mut Session, b: &str| run(s, "inspect.measure", json!({"bodies": [b]}))["total"]["volume_mm3"].as_f64().unwrap();
+    let envelope = volume(&mut s, "Bought Envelope");
+    run(&mut s, "component.activate", json!({"component": "Bought"}));
+    run(&mut s, "solid.box", json!({"corner": [108, 8, 8], "length": 4, "width": 4, "height": 4, "operation": "cut"}));
+    run(&mut s, "component.activate", json!({"component": "root"}));
+    let plate = volume(&mut s, "Plate");
+    assert!((plate - 992.0).abs() < 1e-6, "the plate is cut: {plate}, envelope {envelope} -> {}", volume(&mut s, "Bought Envelope"));
+    assert!((volume(&mut s, "Bought Envelope") - envelope).abs() < 1e-6, "the envelope is left alone");
+    // A cut from the root, which has no body of its own, takes part in every body (`*`): the
+    // parts, never the envelope.
+    run(&mut s, "sketch.create", json!({"plane": "XY"}));
+    run(&mut s, "sketch.rectangle.two_point", json!({"p0": [100, 0], "p1": [102, 2]}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "solid.extrude", json!({"distance": 5, "operation": "cut"}));
+    assert_eq!(s.doc.features.last().unwrap().participants, vec!["*".to_string()]);
+    let plate = volume(&mut s, "Plate");
+    assert!((plate - 972.0).abs() < 1e-6, "the plate is cut from the root: {plate}");
+    assert!((volume(&mut s, "Bought Envelope") - envelope).abs() < 1e-6, "the envelope is left alone by `*`");
+}
+
+/// An envelope smaller than its contents could miss a contact: a negative margin, single or for
+/// one side, is refused for an envelope.
+#[test]
+fn an_envelope_refuses_a_negative_margin() {
+    for margins in [json!({"margin": -1}), json!({"margins": [0, 0, 0, 0, "-0.5 mm", 0]})] {
+        let mut s = Session::default();
+        run(&mut s, "component.create", json!({"name": "Bought"}));
+        run(&mut s, "solid.box", json!({"corner": [0, 0, 0], "length": 10, "width": 10, "height": 10}));
+        run(&mut s, "component.activate", json!({"component": "root"}));
+        let mut p = json!({"component": "Bought", "body_name": "Envelope"});
+        p.as_object_mut().unwrap().extend(margins.as_object().unwrap().clone());
+        let refused = s.execute("solid.bounding_solid", &p);
+        assert!(
+            refused.is_err() || s.model.results.last().is_some_and(|r| r.error.as_deref().is_some_and(|e| e.contains("negative"))),
+            "{margins}: {refused:?}"
+        );
+        assert!(s.model.state().body("Envelope").is_none(), "{margins}");
+    }
+}
+
+/// A body stretched by a non-uniform `solid.scale` keeps its flat faces flat, so a boolean whose
+/// tool crosses a stretched side wall comes out right (#14409). The faces used to become free-form
+/// surfaces, and then a cylinder standing on the x side wall made the join and the cut fail SMLib's
+/// check and the intersect silently return the whole cylinder segment, twice the volume.
+#[test]
+fn booleans_across_the_walls_of_a_non_uniformly_scaled_body() {
+    let planes = |s: &Session, name: &str| {
+        let st = s.model.state();
+        let body = st.bodies.iter().find(|b| b.name == name).unwrap();
+        body.body.record().faces.iter().all(|f| matches!(f.surface, solidcore_record::brep::Surface::Plane { .. }))
+    };
+    let measured = |s: &mut Session, name: &str| run(s, "inspect.measure", json!({"bodies": [name]}))["total"]["volume_mm3"].as_f64().unwrap();
+    // A 20 x 20 x 10 box scaled by [a, b, c], and a cylinder r5 from z = -5 to 35, its axis at
+    // (x, 10 b): on the scaled box's x = 20 a wall for x = 20 a, through the middle for x = 10 a.
+    let combined = |factors: [f64; 3], x: f64, operation: &str| {
+        let mut s = Session::default();
+        run(&mut s, "solid.box", json!({"length": 20, "width": 20, "height": 10, "body_name": "X"}));
+        run(&mut s, "solid.scale", json!({"bodies": ["X"], "factors": factors}));
+        assert!(planes(&s, "X"), "{factors:?}: the scaled box's faces are not all planes");
+        let base = [x, 10.0 * factors[1], -5.0];
+        run(&mut s, "solid.cylinder", json!({"radius": 5, "height": 40, "base": base, "axis": "Z", "body_name": "Z"}));
+        run(&mut s, "solid.combine", json!({"target": "X", "tools": ["Z"], "operation": operation}));
+        assert!(s.model.results.iter().all(|r| r.error.is_none()), "{factors:?} {operation}: {:?}", s.model.results);
+        let st = s.model.state();
+        let body = st.bodies.iter().find(|b| b.name == "X").unwrap();
+        assert!(body.body.validity().is_empty(), "{factors:?} {operation}: {:?}", body.body.validity());
+        let faces = body.body.face_count();
+        (measured(&mut s, "X"), faces)
+    };
+    // The cylinder through the middle crosses only the top and bottom.
+    let (got, _) = combined([1.0, 1.0, 2.0], 10.0, "join");
+    assert!(rel(got, 8000.0 + 500.0 * PI) < 1e-5, "{got}");
+    for factors in [[1.0, 1.0, 0.5], [1.0, 1.0, 2.0], [2.0, 1.0, 1.0], [1.0, 2.0, 1.0], [2.0, 2.0, 1.0], [1.5, 1.5, 0.4], [1.5, 1.5, 1.0]] {
+        let [a, b, c] = factors;
+        let (stretched, cylinder, inside) = (4000.0 * a * b * c, 1000.0 * PI, 125.0 * PI * c);
+        let x = 20.0 * a;
+        let (got, _) = combined(factors, x, "join");
+        assert!(rel(got, stretched + cylinder - inside) < 1e-5, "{factors:?} join: {got} vs {}", stretched + cylinder - inside);
+        let (got, faces) = combined(factors, x, "intersect");
+        assert!(rel(got, inside) < 1e-5, "{factors:?} intersect: {got} vs {inside}");
+        // A flat side, the wall (one face or two, by where the cylinder's seams fall), top and
+        // bottom; the whole cylinder segment that came out before had three.
+        assert!(faces >= 4, "{factors:?} intersect: {faces} faces, the flat side is missing");
+        let (got, _) = combined(factors, x, "cut");
+        assert!(rel(got, stretched - inside) < 1e-5, "{factors:?} cut: {got} vs {}", stretched - inside);
+    }
+    // An L prism extruded 12 and scaled to 24 tall joins a cylinder as the same prism extruded 24.
+    let l_prism = |distance: f64, factors: Option<[f64; 3]>| {
+        let mut s = Session::default();
+        run(&mut s, "sketch.create", json!({"plane": "XY", "name": "L"}));
+        run(&mut s, "sketch.line", json!({"points": [[0, 0], [40, 0], [40, 10], [10, 10], [10, 40], [0, 40]], "closed": true}));
+        run(&mut s, "sketch.finish", json!({}));
+        run(&mut s, "solid.extrude", json!({"sketch": "L", "distance": distance, "body_name": "X"}));
+        if let Some(factors) = factors {
+            run(&mut s, "solid.scale", json!({"bodies": ["X"], "factors": factors}));
+            assert!(planes(&s, "X"), "the scaled L prism's faces are not all planes");
+        }
+        run(&mut s, "solid.cylinder", json!({"radius": 6, "height": 30, "base": [8, 12, -5], "axis": "Z", "body_name": "Z"}));
+        run(&mut s, "solid.combine", json!({"target": "X", "tools": ["Z"], "operation": "join"}));
+        assert!(s.model.results.iter().all(|r| r.error.is_none()), "L prism {factors:?}: {:?}", s.model.results);
+        measured(&mut s, "X")
+    };
+    let (scaled, built) = (l_prism(12.0, Some([1.0, 1.0, 2.0])), l_prism(24.0, None));
+    assert!(rel(scaled, built) < 1e-6, "{scaled} vs {built}");
+    assert!(scaled > 700.0 * 24.0, "{scaled}");
+}
+
+/// Regression: deleting a pipe's path sketch left the pipe in the timeline ("unknown sketch").
+#[test]
+fn deleting_a_path_sketch_deletes_its_pipe() {
+    let mut s = Session::default();
+    run(&mut s, "sketch.create", json!({"plane": "XY", "name": "Path"}));
+    run(&mut s, "sketch.line", json!({"points": [[0, 0], [30, 0]], "ids": ["l1"]}));
+    run(&mut s, "sketch.finish", json!({}));
+    let pipe = run(&mut s, "solid.pipe", json!({"path_sketch": "Path", "path": ["l1"], "diameter": 4}));
+    let deps = run(&mut s, "timeline.dependents", json!({"feature": "Path"}));
+    assert_eq!(deps["deleted_with_it"].as_array().map(Vec::len), Some(1), "{deps} (pipe {pipe})");
+    let r = run(&mut s, "timeline.delete", json!({"features": ["Path"]}));
+    assert_eq!(r["deleted"].as_array().map(Vec::len), Some(2), "{r}");
+    assert!(s.doc.features.is_empty(), "{:?}", s.doc.features.iter().map(|f| &f.name).collect::<Vec<_>>());
+    assert!(s.model.results.iter().all(|r| r.error.is_none()));
+}
+
+/// Regression: batches were rolled back by undoing as many steps as the undo history grew,
+/// which is none once the history is full, leaving their sketches behind.
+#[test]
+fn checkpoint_restores_with_a_full_undo_history() {
+    let mut s = Session::default();
+    for i in 0..MAX_UNDO + 5 {
+        run(&mut s, "parameters.add", json!({"name": format!("p{i}"), "expression": "1 mm"}));
+    }
+    assert_eq!(s.undo.len(), MAX_UNDO);
+    let labels: Vec<String> = s.undo.iter().map(|u| u.label.clone()).collect();
+    let doc = s.doc.clone();
+    let id = run(&mut s, "edit.checkpoint", json!({}))["checkpoint"].as_u64().unwrap();
+    run(&mut s, "sketch.create", json!({"plane": "XY", "name": "TapHole"}));
+    run(&mut s, "sketch.circle.center", json!({"center": [0, 0], "radius": 2}));
+    assert!(s.active_sketch.is_some());
+    run(&mut s, "edit.restore_checkpoint", json!({"checkpoint": id}));
+    assert!(Arc::ptr_eq(&s.doc, &doc) && s.active_sketch.is_none());
+    assert!(s.doc.find_feature("TapHole").is_none());
+    assert_eq!(s.undo.iter().map(|u| u.label.clone()).collect::<Vec<_>>(), labels);
+    // Used up: a second restore is an error, not a jump somewhere else.
+    assert!(s.execute("edit.restore_checkpoint", &json!({"checkpoint": id})).is_err());
+    // Forgetting one leaves the design alone.
+    let id = run(&mut s, "edit.checkpoint", json!({}))["checkpoint"].as_u64().unwrap();
+    run(&mut s, "sketch.create", json!({"plane": "XY", "name": "Kept"}));
+    run(&mut s, "edit.restore_checkpoint", json!({"checkpoint": id, "forget": true}));
+    assert!(s.doc.find_feature("Kept").is_some());
+    assert!(s.execute("edit.restore_checkpoint", &json!({"checkpoint": id})).is_err());
+}
+
+/// Regression (#9746): a checkpoint restored already, or one of more than the 16 kept, was
+/// refused with only "no checkpoint N", so a script that restores twice could not tell why.
+#[test]
+fn a_used_up_or_dropped_checkpoint_says_why() {
+    let mut s = Session::default();
+    let id = run(&mut s, "edit.checkpoint", json!({}))["checkpoint"].as_u64().unwrap();
+    run(&mut s, "edit.restore_checkpoint", json!({"checkpoint": id}));
+    let used = s.execute("edit.restore_checkpoint", &json!({"checkpoint": id})).unwrap_err().to_string();
+    assert!(used.contains("used up") && used.contains("16"), "{used}");
+    let first = run(&mut s, "edit.checkpoint", json!({}))["checkpoint"].as_u64().unwrap();
+    for _ in 0..MAX_CHECKPOINTS {
+        run(&mut s, "edit.checkpoint", json!({}));
+    }
+    let dropped = s.execute("edit.restore_checkpoint", &json!({"checkpoint": first})).unwrap_err().to_string();
+    assert!(dropped.contains("16"), "{dropped}");
+    run(&mut s, "edit.restore_checkpoint", json!({"checkpoint": first + 1}));
+}
+
+/// Regression (#15865): forgetting a checkpoint dropped every later one too, so a batch that
+/// forgot its own rollback checkpoint took the checkpoint one of its steps had returned with it.
+#[test]
+fn forgetting_a_checkpoint_keeps_the_later_ones() {
+    let mut s = Session::default();
+    let empty = s.doc.clone();
+    let earlier = run(&mut s, "edit.checkpoint", json!({}))["checkpoint"].as_u64().unwrap();
+    let outer = run(&mut s, "edit.checkpoint", json!({}))["checkpoint"].as_u64().unwrap();
+    run(&mut s, "solid.box", json!({"name": "Kept", "length": 10, "width": 10, "height": 10}));
+    let inner = run(&mut s, "edit.checkpoint", json!({}))["checkpoint"].as_u64().unwrap();
+    let doc = s.doc.clone();
+    let undo = s.undo.len();
+    run(&mut s, "edit.restore_checkpoint", json!({"checkpoint": outer, "forget": true}));
+    assert!(s.execute("edit.restore_checkpoint", &json!({"checkpoint": outer})).is_err());
+    run(&mut s, "solid.box", json!({"name": "Later", "length": 5, "width": 5, "height": 5, "corner": [20, 0, 0]}));
+    let back = run(&mut s, "edit.restore_checkpoint", json!({"checkpoint": inner}));
+    assert_eq!(back["restored"], true, "{back}");
+    assert!(Arc::ptr_eq(&s.doc, &doc) && s.doc.find_feature("Kept").is_some() && s.doc.find_feature("Later").is_none());
+    assert_eq!(s.undo.len(), undo);
+    // Restoring still uses up every later checkpoint: they hold states after the one restored.
+    let first = run(&mut s, "edit.checkpoint", json!({}))["checkpoint"].as_u64().unwrap();
+    let second = run(&mut s, "edit.checkpoint", json!({}))["checkpoint"].as_u64().unwrap();
+    run(&mut s, "edit.restore_checkpoint", json!({"checkpoint": first}));
+    assert!(s.execute("edit.restore_checkpoint", &json!({"checkpoint": second})).is_err());
+    // Neither forgetting a later checkpoint nor restoring one used up the earlier one.
+    run(&mut s, "edit.restore_checkpoint", json!({"checkpoint": earlier}));
+    assert!(Arc::ptr_eq(&s.doc, &empty) && s.undo.is_empty());
+}
+
+/// Regression (#3242): `file.new` replaced the session and its checkpoints with it, so a
+/// batch that failed after `file.new` could not go back to the design it began in.
+#[test]
+fn a_checkpoint_survives_file_new() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 1.0, "width": 1.0, "height": 1.0}));
+    let original_token = s.design_token();
+    let original_bytes = s.doc.to_json();
+    let id = run(&mut s, "edit.checkpoint", json!({}))["checkpoint"].as_u64().unwrap();
+    run(&mut s, "file.new", json!({"name": "Replacement"}));
+    // The volume as SMLib integrates it, to rounding (a unit box measures 1 + 2e-16).
+    let volume = |s: &mut Session| run(s, "inspect.measure", json!({}))["total"]["volume_mm3"].as_f64().unwrap_or(f64::NAN);
+    run(&mut s, "solid.box", json!({"length": 2.0, "width": 2.0, "height": 2.0}));
+    assert!((volume(&mut s) - 8.0).abs() < 1e-12);
+    run(&mut s, "edit.restore_checkpoint", json!({"checkpoint": id}));
+    assert_eq!(s.design_token().document_id, original_token.document_id);
+    assert_ne!(s.design_token().revision, original_token.revision);
+    assert_eq!(s.doc.to_json(), original_bytes);
+    assert_eq!(run(&mut s, "document.revision", json!({}))["document_id"], original_token.document_id);
+    assert!((volume(&mut s) - 1.0).abs() < 1e-12);
+    // The undo history is the restored design's own: one step back is the empty design.
+    run(&mut s, "edit.undo", json!({}));
+    assert!(volume(&mut s).abs() < 1e-12);
+}
+
+#[test]
+fn components_occurrences_and_world_placement() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 10, "width": 10, "height": 10, "body_name": "Base"}));
+    // A component, active: its box is authored in its frame.
+    let c = run(&mut s, "component.create", json!({"name": "Arm", "grounded": false}));
+    let (cid, occ) = (c["component"].as_u64().unwrap(), c["occurrence"].as_u64().unwrap());
+    run(&mut s, "solid.box", json!({"corner": [20, 0, 0], "length": 10, "width": 4, "height": 4, "body_name": "ArmBody"}));
+    run(&mut s, "component.activate", json!({"component": 0}));
+    let bbox = |s: &mut Session, b: &str| run(s, "inspect.measure", json!({ "bodies": [b] }))["bodies"][0]["bbox"].clone();
+    assert_eq!(bbox(&mut s, "ArmBody")["min"][0], 20.0);
+    // Move the occurrence: the world placement follows, the authoring model doesn't change.
+    run(&mut s, "occurrence.move", json!({"occurrence": occ, "translate": [0, 50, 0]}));
+    assert!((bbox(&mut s, "ArmBody")["min"][1].as_f64().unwrap() - 50.0).abs() < 1e-9);
+    assert_eq!(s.model.state().body("ArmBody").unwrap().mesh().bounds().min.y, 0.0);
+    // A fillet picked in the world, while the component is active, lands on its edge.
+    run(&mut s, "component.activate", json!({"component": "Arm"}));
+    run(&mut s, "solid.fillet", json!({"edges": [[25, 54, 4]], "radius": 1}));
+    let v = run(&mut s, "inspect.measure", json!({"bodies": ["ArmBody"]}))["total"]["volume_mm3"].as_f64().unwrap();
+    assert!(rel(v, 160.0 - (1.0 - PI / 4.0) * 10.0) < 1e-4, "{v}");
+    run(&mut s, "component.activate", json!({"component": 0}));
+    // Instances share the contents; a copy is independent.
+    run(&mut s, "occurrence.copy", json!({"component": cid, "translate": [0, 20, 0]}));
+    let w = s.world_state().unwrap();
+    assert_eq!(w.bodies.len(), 3, "{:?}", w.bodies.iter().map(|b| &b.name).collect::<Vec<_>>());
+    let pn = run(&mut s, "component.paste_new", json!({"component": cid, "translate": [0, -30, 0]}));
+    assert_eq!(pn["features"].as_array().map(|a| a.len()), Some(2));
+    assert_eq!(s.world_state().unwrap().bodies.len(), 4);
+    // Ground stops moves; pending moves show until captured or reverted.
+    run(&mut s, "occurrence.ground", json!({"occurrence": occ}));
+    assert!(s.execute("occurrence.move", &json!({"occurrence": occ, "translate": [1, 0, 0]})).is_err());
+    run(&mut s, "occurrence.ground", json!({"occurrence": occ, "grounded": false}));
+    run(&mut s, "occurrence.move", json!({"occurrence": occ, "translate": [0, 0, 5], "capture": false}));
+    assert!((bbox(&mut s, "ArmBody")["min"][2].as_f64().unwrap() - 5.0).abs() < 1e-9);
+    run(&mut s, "component.revert_position", json!({}));
+    assert!(bbox(&mut s, "ArmBody")["min"][2].as_f64().unwrap().abs() < 1e-9);
+    run(&mut s, "occurrence.move", json!({"occurrence": occ, "translate": [0, 0, 5], "capture": false}));
+    run(&mut s, "component.capture_position", json!({}));
+    assert!(s.pending_moves.is_empty());
+    assert!((bbox(&mut s, "ArmBody")["min"][2].as_f64().unwrap() - 5.0).abs() < 1e-9);
+    // A component placed twice gets a body in both instances, placed by the placement named or
+    // active: with neither, the move is refused and names the parameter that would settle it.
+    let document = s.doc.to_json();
+    let pending = s.pending_moves.clone();
+    let error = s.execute("component.move_bodies", &json!({"bodies": ["Base"], "component": "Arm"})).unwrap_err();
+    assert!(error.to_string().contains("placed more than once") && error.to_string().contains("`component_path`"), "{error}");
+    assert_eq!(s.doc.to_json(), document);
+    assert_eq!(s.pending_moves, pending);
+    // Placed by the first placement, the body stays where it is in the world there.
+    run(&mut s, "component.move_bodies", json!({"bodies": ["Base"], "component": "Arm", "component_path": [occ]}));
+    assert_eq!(s.world_state().unwrap().body("Base").unwrap().component, cid);
+    assert_eq!(bbox(&mut s, "Base")["min"], json!([0.0, 0.0, 0.0]));
+    run(&mut s, "edit.undo", json!({}));
+    assert_eq!(s.doc.to_json(), document);
+    // The independent Paste New result has one placement and can receive it.
+    let copied = pn["component"].as_u64().unwrap();
+    run(&mut s, "component.move_bodies", json!({"bodies": ["Base"], "component": copied}));
+    let l = run(&mut s, "component.list", json!({}));
+    let arm = l["components"].as_array().unwrap().iter().find(|x| x["id"] == cid).unwrap().clone();
+    assert!(!arm["bodies"].as_array().unwrap().iter().any(|b| b == "Base"), "{arm}");
+    let receiver = l["components"].as_array().unwrap().iter().find(|x| x["id"] == copied).unwrap();
+    assert!(receiver["bodies"].as_array().unwrap().iter().any(|b| b == "Base"), "{receiver}");
+    assert_eq!(bbox(&mut s, "Base")["min"], json!([0.0, 0.0, 0.0]));
+    run(&mut s, "sketch.create", json!({"plane": "XY", "name": "S1"}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "component.move_sketches", json!({"sketches": ["S1"], "component": cid}));
+    assert_eq!(s.doc.find_feature("S1").unwrap().component, cid);
+    // Undo/redo and the timeline work with features in components.
+    run(&mut s, "edit.undo", json!({}));
+    assert_eq!(s.doc.find_feature("S1").unwrap().component, 0);
+    run(&mut s, "edit.redo", json!({}));
+    run(&mut s, "timeline.roll_to", json!({"position": 1}));
+    // The ownership boundary is later: before it Base remains the sole root body.
+    assert_eq!(s.world_state().unwrap().bodies.len(), 1);
+    assert_eq!(s.world_state().unwrap().body("Base").unwrap().component, 0);
+    run(&mut s, "timeline.roll_to", json!({}));
+    // Saved and loaded; older designs get occurrences.
+    let back = solidcraft_doc::Document::from_json(&s.doc.to_json()).unwrap();
+    assert_eq!(back.occurrences.len(), s.doc.occurrences.len());
+    let mut old: serde_json::Value = serde_json::from_str(&s.doc.to_json()).unwrap();
+    old.as_object_mut().unwrap().remove("occurrences");
+    let migrated = solidcraft_doc::Document::from_json(&old.to_string()).unwrap();
+    assert_eq!(migrated.occurrences.len(), migrated.components.len());
+}
+
+#[test]
+fn feature_inputs_are_parameters() {
+    let mut s = Session::default();
+    run(&mut s, "parameters.change", json!({"name": "w", "expression": "15 mm", "comment": "width"}));
+    run(&mut s, "solid.box", json!({"length": 10, "width": "w", "height": "1 in", "name": "B"}));
+    let l = run(&mut s, "parameters.list", json!({}));
+    let rows = l["parameters"].as_array().unwrap();
+    let feat: Vec<&Value> = rows.iter().filter(|r| r["source"] == "feature").collect();
+    assert_eq!(feat.len(), 3, "{l}");
+    let height = feat.iter().find(|r| r["input"] == "Height").unwrap();
+    assert!((height["value"].as_f64().unwrap() - 25.4).abs() < 1e-9);
+    let length_name = feat.iter().find(|r| r["input"] == "Length").unwrap()["name"].as_str().unwrap().to_string();
+    // A feature parameter changes the feature; other expressions can use it.
+    run(&mut s, "parameters.change", json!({"name": length_name, "expression": "2 * w"}));
+    assert!(rel(volume(&mut s), 30.0 * 15.0 * 25.4) < 1e-9);
+    run(&mut s, "parameters.change", json!({"name": "t", "expression": format!("{length_name} / 3")}));
+    let t = run(&mut s, "parameters.list", json!({}))["parameters"].as_array().unwrap().iter().find(|r| r["name"] == "t").unwrap()["value"]
+        .as_f64()
+        .unwrap();
+    assert!((t - 10.0).abs() < 1e-9);
+    // Cycles are refused.
+    assert!(s.execute("parameters.change", &json!({"name": "w", "expression": "t"})).is_err());
+    // Favourites, export and import.
+    run(&mut s, "parameters.favorite", json!({"name": "w"}));
+    assert_eq!(run(&mut s, "parameters.list", json!({"favorites": true}))["parameters"].as_array().unwrap().len(), 1);
+    let csv = run(&mut s, "parameters.export", json!({}))["text"].as_str().unwrap().to_string();
+    assert!(csv.contains("w,mm,15 mm,15,width,true"), "{csv}");
+    run(&mut s, "parameters.import", json!({"text": "name,unit,expression,comment\nw,mm,20 mm,wider\nnew_p,mm,\"w + 1\","}));
+    assert!(rel(volume(&mut s), 40.0 * 20.0 * 25.4) < 1e-9);
+    run(&mut s, "parameters.import", json!({"text": "[{\"name\": \"w\", \"expression\": \"12\"}]"}));
+    assert!(rel(volume(&mut s), 24.0 * 12.0 * 25.4) < 1e-9);
+    assert!(s.execute("parameters.import", &json!({"text": "name,expression\nw,1/"})).is_err());
+    // Saved and reloaded, the names stay.
+    let back = solidcraft_doc::Document::from_json(&s.doc.to_json()).unwrap();
+    assert_eq!(back.features[0].param_names, s.doc.features[0].param_names);
+}
+
+#[test]
+fn rolling_back_and_forward_leaves_no_projection_warnings() {
+    let mut s = Session::default();
+    s.run_script(&crate::sample::script()).unwrap();
+    let warnings = |s: &Session| -> Vec<String> {
+        s.doc.features.iter().filter_map(|f| s.model.result(f.id).and_then(|r| r.warning.clone()).map(|w| format!("{}: {w}", f.name))).collect()
+    };
+    assert!(warnings(&s).is_empty(), "{:?}", warnings(&s));
+    for pos in 0..s.doc.features.len() {
+        run(&mut s, "timeline.roll_to", json!({ "position": pos }));
+        run(&mut s, "timeline.roll_to", json!({}));
+        assert!(warnings(&s).is_empty(), "after rolling to {pos}: {:?}", warnings(&s));
+    }
+}
+
+/// Export STEP, validate the file, read it back: no warnings, same volume, area and faces.
+fn step_round_trip(s: &mut Session, tag: &str) -> solidcraft_kernel::StepImport {
+    let p = std::env::temp_dir().join(format!("solidcraft-steprt-{tag}-{}.step", std::process::id()));
+    run(s, "file.export", json!({"path": p.to_string_lossy()}));
+    let text = std::fs::read_to_string(&p).unwrap();
+    let _ = std::fs::remove_file(&p);
+    solidcraft_kernel::step_validate(&text).unwrap();
+    assert_eq!(solidcraft_kernel::step_orientation_errors(&text).unwrap(), Vec::<String>::new());
+    assert!(text.contains("AP242_MANAGED_MODEL_BASED_3D_ENGINEERING_MIM_LF"));
+    let imp = solidcraft_kernel::step_import(&text).unwrap();
+    assert!(imp.warnings.is_empty(), "{:?}", imp.warnings);
+    imp
+}
+
+#[test]
+fn sample_plate_step_round_trip() {
+    let mut s = Session::default();
+    s.run_script(&crate::sample::script()).unwrap();
+    let imp = step_round_trip(&mut s, "sample");
+    let st = s.world_state().unwrap();
+    assert_eq!(imp.bodies.len(), st.bodies.len());
+    for (a, b) in st.bodies.iter().zip(&imp.bodies) {
+        assert_eq!(a.name, b.name);
+        let (ma, mb) = (solidcraft_kernel::measure(&a.body).unwrap(), solidcraft_kernel::measure(&b.body).unwrap());
+        assert!(rel(mb.volume, ma.volume) < 1e-4, "{} vs {}", mb.volume, ma.volume);
+        assert!(rel(mb.area, ma.area) < 1e-4, "{} vs {}", mb.area, ma.area);
+        assert!(b.file_faces <= a.body.face_count() && b.file_faces >= ma.merged.faces.min(a.body.face_count()));
+        assert_eq!(mb.merged.faces, ma.merged.faces);
+    }
+}
+
+/// Bodies export in the colour they are shown in: a material's look, an appearance over it,
+/// none for the default; and colours read from a STEP file survive the next export.
+#[test]
+fn material_and_appearance_colours_export_to_step() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 10, "width": 10, "height": 10, "body_name": "BrassBox"}));
+    run(&mut s, "solid.box", json!({"corner": [20, 0, 0], "length": 10, "width": 10, "height": 10, "body_name": "RedAbs"}));
+    run(&mut s, "solid.box", json!({"corner": [40, 0, 0], "length": 10, "width": 10, "height": 10, "body_name": "Plain"}));
+    run(&mut s, "material.assign", json!({"bodies": ["BrassBox"], "material": "Brass"}));
+    run(&mut s, "material.assign", json!({"bodies": ["RedAbs"], "material": "ABS Plastic"}));
+    run(&mut s, "appearance.assign", json!({"bodies": ["RedAbs"], "color": "#d01c1c"}));
+    assert!(s.execute("appearance.assign", &json!({"bodies": ["RedAbs"], "color": "#12"})).is_err());
+    let rgb = |c: [u8; 3]| c.map(|x| x as f32 / 255.0);
+    let want =
+        [("BrassBox", Some(rgb(solidcraft_doc::material_color("Brass").unwrap()))), ("RedAbs", Some(rgb([0xd0, 0x1c, 0x1c]))), ("Plain", None)];
+    let same = |a: Option<[f32; 3]>, b: Option<[f32; 3]>| match (a, b) {
+        (Some(a), Some(b)) => a.iter().zip(b).all(|(x, y)| (x - y).abs() < 1e-3),
+        (None, None) => true,
+        _ => false,
+    };
+    let check = |imp: &solidcraft_kernel::StepImport| {
+        for (name, c) in want {
+            let b = imp.bodies.iter().find(|b| b.name == name).unwrap_or_else(|| panic!("no body {name}"));
+            assert!(same(b.body.color(), c), "{name}: {:?} vs {c:?}", b.body.color());
+        }
+    };
+    check(&step_round_trip(&mut s, "colours"));
+    // Open the export and export again: the file's colours are kept.
+    let p = std::env::temp_dir().join(format!("solidcraft-colours-{}.step", std::process::id()));
+    run(&mut s, "file.export", json!({"path": p.to_string_lossy()}));
+    let mut s2 = Session::default();
+    run(&mut s2, "doc.open", json!({"path": p.to_string_lossy()}));
+    let _ = std::fs::remove_file(&p);
+    check(&step_round_trip(&mut s2, "colours2"));
+}
+
+/// The OBJ export carries the colours of the bodies: the mesh file names a material library
+/// beside it, and the library holds a material per body.
+#[test]
+fn obj_export_writes_the_colours_of_the_bodies() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 10, "width": 10, "height": 10, "body_name": "Red Box"}));
+    run(&mut s, "appearance.assign", json!({"bodies": ["Red Box"], "color": "#d03030"}));
+    let dir = std::env::temp_dir().join(format!("solidcraft-objcolours-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let obj = dir.join("part.obj");
+    run(&mut s, "file.export", json!({"path": obj.to_string_lossy(), "format": "obj"}));
+    let text = std::fs::read_to_string(&obj).unwrap();
+    assert!(text.contains("\nmtllib part.mtl\n"), "{text}");
+    let mtl = std::fs::read_to_string(dir.join("part.mtl")).unwrap();
+    assert!(mtl.contains("\nnewmtl Red_Box\n"), "{mtl}");
+    assert!(mtl.contains("Kd 0.816 0.188 0.188"), "{mtl}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Face appearances and see-through bodies export: STEP styles on the faces with a
+/// transparency, read back as face colours.
+#[test]
+fn face_colours_and_opacity_export() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 10, "width": 10, "height": 10, "body_name": "Cube"}));
+    run(&mut s, "appearance.assign", json!({"bodies": ["Cube"], "color": "#2040c0", "opacity": 0.5}));
+    run(&mut s, "appearance.assign", json!({"faces": [[5, 5, 10]], "color": "#ff0000"}));
+    let imp = step_round_trip(&mut s, "facecol");
+    let b = &imp.bodies[0];
+    let paint = b.body.paint().expect("paint read back");
+    assert!((paint.opacity - 0.5).abs() < 1e-3, "{paint:?}");
+    let faces = b.body.faces(0.01).unwrap();
+    let top = faces.iter().position(|f| (f.centroid.z - 10.0).abs() < 1e-6).unwrap();
+    assert_eq!(paint.faces.len(), 1, "{paint:?}");
+    assert_eq!(paint.faces[0].face, top);
+    assert!((paint.faces[0].color[0] - 1.0).abs() < 1e-3 && paint.faces[0].color[1].abs() < 1e-3, "{paint:?}");
+    // Opened again, the face keeps its colour (shown and exported).
+    let p = std::env::temp_dir().join(format!("solidcraft-facecol-{}.step", std::process::id()));
+    run(&mut s, "file.export", json!({"path": p.to_string_lossy()}));
+    let mut s2 = Session::default();
+    run(&mut s2, "doc.open", json!({"path": p.to_string_lossy()}));
+    let _ = std::fs::remove_file(&p);
+    let st = s2.world_state().unwrap();
+    let looks = s2.doc.face_colors(&st.bodies[0]);
+    assert_eq!(looks.len(), 1);
+    assert_eq!(looks[0].1.color, [255, 0, 0]);
+}
+
+/// IGES: a design exports as IGES and the file opens again as an Import feature with the same
+/// bodies, names and colours.
+#[test]
+fn iges_export_and_open() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 40, "width": 30, "height": 5, "body_name": "Plate"}));
+    run(&mut s, "solid.cylinder", json!({"radius": 4, "height": 20, "base": [10, 10, 5], "body_name": "Pin"}));
+    run(&mut s, "appearance.assign", json!({"bodies": ["Pin"], "color": "#ff0000"}));
+    let want: Vec<f64> = s.world_state().unwrap().bodies.iter().map(|b| solidcraft_kernel::measure(&b.body).unwrap().volume).collect();
+    let p = std::env::temp_dir().join(format!("solidcraft-iges-{}.igs", std::process::id()));
+    run(&mut s, "file.export", json!({"path": p.to_string_lossy()}));
+    let mut s2 = Session::default();
+    run(&mut s2, "doc.open", json!({"path": p.to_string_lossy()}));
+    let _ = std::fs::remove_file(&p);
+    let st = s2.world_state().unwrap();
+    let names: Vec<&str> = st.bodies.iter().map(|b| b.name.as_str()).collect();
+    assert_eq!(names, ["Plate", "Pin"]);
+    for (b, v) in st.bodies.iter().zip(&want) {
+        assert!(rel(solidcraft_kernel::measure(&b.body).unwrap().volume, *v) < 1e-4);
+    }
+    assert_eq!(st.bodies[1].body.color(), Some([1.0, 0.0, 0.0]));
+}
+
+/// Split Body by a face of another body (its surface extended): a box cut by a cylinder's
+/// side into the core and the rest; volumes add up exactly.
+#[test]
+fn split_body_by_a_face() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 10, "width": 20, "height": 30, "body_name": "Block"}));
+    run(&mut s, "solid.cylinder", json!({"radius": 4, "height": 40, "base": [5, 10, -5], "body_name": "Tool"}));
+    run(&mut s, "solid.split_body", json!({"body": "Block", "tool": {"body": "Tool", "point": [9, 10, 10]}}));
+    let st = s.world_state().unwrap();
+    let mut v: Vec<f64> =
+        st.bodies.iter().filter(|b| b.name.starts_with("Block")).map(|b| solidcraft_kernel::measure(&b.body).unwrap().volume).collect();
+    v.sort_by(f64::total_cmp);
+    let core = PI * 16.0 * 30.0;
+    assert!(v.len() == 2 && rel(v[0], core) < 1e-3 && rel(v[1], 6000.0 - core) < 1e-3, "{v:?}");
+    assert!(s.execute("solid.split_body", &json!({"body": "Block", "tool": {"body": "Tool", "point": [100, 0, 0]}})).is_err());
+}
+
+/// Split Body by a face follows the face when a parameter moves it (#11674): the tool face is
+/// named when it is picked, as other face picks are, and found again where it went.
+#[test]
+fn split_body_by_a_face_follows_the_face() {
+    let build = |h: &str, z: f64| {
+        let mut s = Session::default();
+        run(&mut s, "parameters.add", json!({"name": "h", "expression": h}));
+        run(&mut s, "solid.box", json!({"length": 40, "width": 40, "height": 200, "center": [0, 0, 100], "body_name": "Post"}));
+        run(&mut s, "solid.cylinder", json!({"diameter": 42, "height": 300, "base": [-150, 0, "h"], "axis": "X", "body_name": "Rail"}));
+        run(&mut s, "solid.split_body", json!({"body": "Post", "tool": {"body": "Rail", "point": [0, 0, z]}}));
+        s
+    };
+    let volumes = |s: &Session| {
+        let st = s.world_state().unwrap();
+        let mut v: Vec<f64> =
+            st.bodies.iter().filter(|b| b.name.starts_with("Post")).map(|b| solidcraft_kernel::measure(&b.body).unwrap().volume).collect();
+        v.sort_by(f64::total_cmp);
+        v
+    };
+    let mut s = build("100 mm", 79.0);
+    run(&mut s, "parameters.change", json!({"name": "h", "expression": "150 mm"}));
+    let errors: Vec<String> = s.model.results.iter().filter_map(|r| r.error.as_ref().map(|e| format!("{}: {e}", r.name))).collect();
+    assert!(errors.is_empty(), "{errors:?}");
+    // As if the rail had been at 150 mm when the face was picked.
+    let (got, want) = (volumes(&s), volumes(&build("150 mm", 129.0)));
+    assert!(got.len() >= 2 && got.len() == want.len() && got.iter().zip(&want).all(|(a, b)| rel(*a, *b) < 1e-9), "{got:?} against {want:?}");
+}
+
+/// Split Body by a sketch line (#1552): the plane through the line along the sketch's normal
+/// splits a box; the split follows the line when the sketch changes, the design saves the line,
+/// and anything but a straight line of a sketch is refused.
+#[test]
+fn split_body_by_a_sketch_line() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 10, "width": 20, "height": 30, "body_name": "Block"}));
+    let sk = run(&mut s, "sketch.create", json!({"plane": "XY"}))["sketch"].as_u64().unwrap();
+    run(&mut s, "sketch.line", json!({"points": [[4, -5], [4, 25]], "ids": ["cut"]}));
+    run(&mut s, "sketch.circle.center", json!({"center": [50, 50], "radius": 2, "id": "c"}));
+    run(&mut s, "sketch.finish", json!({}));
+    let volumes = |s: &Session| {
+        let st = s.world_state().unwrap();
+        let mut v: Vec<f64> =
+            st.bodies.iter().filter(|b| b.name.starts_with("Block")).map(|b| solidcraft_kernel::measure(&b.body).unwrap().volume).collect();
+        v.sort_by(f64::total_cmp);
+        v
+    };
+    for bad in [
+        json!({"body": "Block", "sketch": sk, "line": "c"}),
+        json!({"body": "Block", "sketch": sk}),
+        json!({"body": "Block", "sketch": 999, "line": "cut"}),
+    ] {
+        assert!(s.execute("solid.split_body", &bad).is_err(), "{bad}");
+    }
+    run(&mut s, "solid.split_body", json!({"body": "Block", "sketch": sk, "line": "cut"}));
+    let v = volumes(&s);
+    assert!(v.len() == 2 && rel(v[0], 2400.0) < 1e-6 && rel(v[1], 3600.0) < 1e-6, "{v:?}");
+    // The split follows the line.
+    run(&mut s, "sketch.edit", json!({"sketch": sk}));
+    run(&mut s, "sketch.move_point", json!({"point": "cut.start", "to": [2, -5]}));
+    run(&mut s, "sketch.move_point", json!({"point": "cut.end", "to": [2, 25]}));
+    run(&mut s, "sketch.finish", json!({}));
+    let v = volumes(&s);
+    assert!(v.len() == 2 && rel(v[0], 1200.0) < 1e-6 && rel(v[1], 4800.0) < 1e-6, "{v:?}");
+    // The design keeps the sketch and the line.
+    let saved: Value = serde_json::from_str(&s.doc.to_json()).unwrap();
+    let split = saved["features"].as_array().and_then(|f| f.iter().find(|f| f["type"] == "split")).cloned().unwrap();
+    assert_eq!((split["sketch"].as_u64(), split["line"].as_str()), (Some(sk), Some("cut")), "{split}");
+}
+
+/// A 10 mm block in a new component, then the design's root active again.
+fn block_in_component(s: &mut Session) -> (u64, u64) {
+    let created = run(s, "component.create", json!({"name": "Part"}));
+    let component = created["component"].as_u64().unwrap();
+    let occurrence = created["occurrence"].as_u64().unwrap();
+    run(s, "solid.box", json!({"length": 10, "width": 10, "height": 10, "body_name": "Block"}));
+    run(s, "component.activate", json!({"component": 0}));
+    (component, occurrence)
+}
+
+fn body_components(s: &Session) -> Vec<(String, u64)> {
+    let st = s.model.state();
+    let mut v: Vec<(String, u64)> = st.bodies.iter().map(|b| (b.name.clone(), s.doc.model_body_component(b))).collect();
+    v.sort();
+    v
+}
+
+/// Split Body made while another component is active: every piece stays in the component the
+/// body belongs to (an imported part split from the design's root, #2979), not only the first.
+#[test]
+fn split_body_pieces_stay_in_the_component_of_the_split_body() {
+    let mut s = Session::default();
+    let (component, _) = block_in_component(&mut s);
+    run(&mut s, "solid.split_body", json!({"body": "Block", "plane": {"origin": [4, 0, 0], "normal": [1, 0, 0]}}));
+    assert_eq!(body_components(&s), [("Block".to_string(), component), ("Block (1)".to_string(), component)]);
+    // The design's owner sets agree.
+    let st = s.model.state();
+    assert_eq!(s.doc.body_owners(&st), std::collections::HashSet::from([component]));
+}
+
+/// The same for a body moved into a component after it was made.
+#[test]
+fn split_body_piece_of_a_body_moved_into_a_component_stays_there() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 10, "width": 10, "height": 10, "body_name": "Block"}));
+    let created = run(&mut s, "component.from_bodies", json!({"bodies": ["Block"]}));
+    let component = created["components"][0]["component"].as_u64().unwrap();
+    run(&mut s, "component.activate", json!({"component": 0}));
+    run(&mut s, "solid.split_body", json!({"body": "Block", "plane": {"origin": [4, 0, 0], "normal": [1, 0, 0]}}));
+    assert_eq!(body_components(&s), [("Block".to_string(), component), ("Block (1)".to_string(), component)]);
+}
+
+/// The pieces of a body in a placed component are shown where the body was.
+#[test]
+fn split_body_pieces_are_shown_where_the_body_was() {
+    let mut s = Session::default();
+    let (_, occurrence) = block_in_component(&mut s);
+    // The design's first part is grounded when it is made.
+    run(&mut s, "occurrence.ground", json!({"occurrence": occurrence, "grounded": false}));
+    run(&mut s, "occurrence.move", json!({"occurrence": occurrence, "translate": [30, 0, 0], "capture": false}));
+    let before = s.world_state().unwrap().body("Block").unwrap().mesh().bounds();
+    run(&mut s, "solid.split_body", json!({"body": "Block", "plane": {"origin": [34, 0, 0], "normal": [1, 0, 0]}}));
+    let world = s.world_state().unwrap();
+    let (a, b) = (world.body("Block").unwrap().mesh().bounds(), world.body("Block (1)").unwrap().mesh().bounds());
+    // Together the pieces fill the block where it was shown, each on one side of the cut.
+    for p in [a, b] {
+        assert!(p.min.x >= before.min.x - 1e-6 && p.max.x <= before.max.x + 1e-6, "{p:?} outside {before:?}");
+    }
+    assert!((a.min.x.min(b.min.x) - before.min.x).abs() < 1e-6 && (a.max.x.max(b.max.x) - before.max.x).abs() < 1e-6);
+}
+
+/// Split Body of a body of two separate pieces joined into one (#6738): a plane through both
+/// pieces splits it, and each half keeps the half of both pieces. The reporter's flow: one
+/// sketch with two squares 20 mm across and 30 mm apart, both extruded 10 mm as New Body, then
+/// Combine (join). The split used to stop with "the tool does not split the body".
+#[test]
+fn split_body_of_a_body_of_two_pieces_splits_both() {
+    let mut s = Session::default();
+    run(&mut s, "sketch.create", json!({"plane": "XY", "name": "Sketch1"}));
+    run(&mut s, "sketch.rectangle.two_point", json!({"p0": [0, 0], "p1": [20, 20]}));
+    run(&mut s, "sketch.rectangle.two_point", json!({"p0": [50, 0], "p1": [70, 20]}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "solid.extrude", json!({"sketch": "Sketch1", "distance": 10, "operation": "new"}));
+    run(&mut s, "solid.combine", json!({"target": "Body1", "tools": ["Body2"], "operation": "join"}));
+    // One body of two pieces before the split.
+    let st = s.world_state().unwrap();
+    assert_eq!(st.bodies.len(), 1, "{:?}", st.bodies.iter().map(|b| &b.name).collect::<Vec<_>>());
+    assert_eq!(st.bodies[0].body.lumps().unwrap().len(), 2);
+    // A plane through the middle of both squares (the extrusion is 10 mm tall).
+    run(&mut s, "solid.split_body", json!({"body": "Body1", "plane": {"origin": [0, 0, 5], "normal": [0, 0, 1]}}));
+    let st = s.world_state().unwrap();
+    assert_eq!(st.bodies.len(), 2, "{:?}", st.bodies.iter().map(|b| &b.name).collect::<Vec<_>>());
+    for b in &st.bodies {
+        // Each half holds the half of both squares: two pieces, half the body each.
+        assert!(rel(solidcraft_kernel::measure(&b.body).unwrap().volume, 4000.0) < 1e-6, "{}", b.name);
+        assert_eq!(b.body.lumps().unwrap().len(), 2, "{}", b.name);
+    }
+}
+
+/// Fillet types: chord length (radius from the face angle) and a radius varying along the
+/// edge; volumes from the removed material.
+#[test]
+fn chord_and_variable_fillets() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 10, "width": 20, "height": 30, "body_name": "B"}));
+    run(&mut s, "solid.fillet", json!({"edges": [[10, 10, 30]], "radius": 4, "type": "chord"}));
+    let r = 4.0 / 2f64.sqrt();
+    let v = solidcraft_kernel::measure(&s.world_state().unwrap().body("B").unwrap().body).unwrap().volume;
+    assert!(rel(v, 6000.0 - (1.0 - PI / 4.0) * r * r * 20.0) < 1e-4, "{v}");
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 10, "width": 20, "height": 30, "body_name": "B"}));
+    run(&mut s, "solid.fillet", json!({"edges": [[10, 10, 30]], "radius": 2, "type": "variable", "radius2": 5, "start": [10, 0, 30]}));
+    let v = solidcraft_kernel::measure(&s.world_state().unwrap().body("B").unwrap().body).unwrap().volume;
+    let removed = (1.0 - PI / 4.0) * 20.0 * (4.0 + 10.0 + 25.0) / 3.0;
+    assert!(rel(v, 6000.0 - removed) < 1e-4, "{v}");
+    assert!(s.execute("solid.fillet", &json!({"edges": [[10, 10, 30]], "radius": 2, "type": "variable"})).is_err());
+    // Down to zero at the far end: the round closes to the corner.
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 10, "width": 20, "height": 30, "body_name": "B"}));
+    run(&mut s, "solid.fillet", json!({"edges": [[10, 10, 30]], "radius": 4, "type": "variable", "radius2": 0, "start": [10, 0, 30]}));
+    let v = solidcraft_kernel::measure(&s.world_state().unwrap().body("B").unwrap().body).unwrap().volume;
+    assert!(rel(v, 6000.0 - (1.0 - PI / 4.0) * 20.0 * 16.0 / 3.0) < 1e-4, "{v}");
+    // A radius through a middle point (a user parameter), straight between: 2 → 4 → 2.
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 10, "width": 20, "height": 30, "body_name": "B"}));
+    run(&mut s, "parameters.add", json!({"name": "waist", "expression": "4 mm"}));
+    run(
+        &mut s,
+        "solid.fillet",
+        json!({"edges": [[10, 10, 30]], "radius": 2, "type": "variable", "radius2": 2, "start": [10, 0, 30], "mid": [[0.5, "waist"]]}),
+    );
+    let vol = |s: &Session| solidcraft_kernel::measure(&s.world_state().unwrap().body("B").unwrap().body).unwrap().volume;
+    // Integrating the union of the rolling balls, as in the kernel's corner-law test.
+    // Compare the removed material directly, so the surrounding 6000 mm³ cannot mask an error.
+    let removed = 6000.0 - vol(&s);
+    assert!(rel(removed, 39.541034) < 1e-4, "{removed}");
+    run(&mut s, "parameters.change", json!({"name": "waist", "expression": "3 mm"}));
+    assert!(rel(6000.0 - vol(&s), 27.093682) < 1e-4, "{}", vol(&s));
+    assert!(
+        s.execute(
+            "solid.fillet",
+            &json!({"edges": [[10, 10, 30]], "radius": 2, "type": "variable", "radius2": 2, "start": [10, 0, 30], "mid": [[1.5, 3]]})
+        )
+        .is_err()
+    );
+}
+
+/// Components export as a STEP assembly: products, occurrences, placements.
+#[test]
+fn components_export_as_step_assembly() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 40, "width": 30, "height": 5, "name": "Plate"}));
+    run(&mut s, "component.create", json!({"name": "Pin"}));
+    run(&mut s, "solid.cylinder", json!({"radius": 2, "height": 10, "base": [5, 5, 5]}));
+    run(&mut s, "occurrence.copy", json!({"component": "Pin", "translate": [20, 0, 0]}));
+    let want: f64 = s.world_state().unwrap().bodies.iter().map(|b| solidcraft_kernel::measure(&b.body).unwrap().volume).sum();
+    let imp = step_round_trip(&mut s, "asm");
+    assert_eq!(imp.bodies.len(), 3, "{:?}", imp.bodies.iter().map(|b| &b.name).collect::<Vec<_>>());
+    let got: f64 = imp.bodies.iter().map(|b| solidcraft_kernel::measure(&b.body).unwrap().volume).sum();
+    assert!(rel(got, want) < 1e-4, "{got} vs {want}");
+    let root = &imp.tree[0];
+    assert_eq!(root.children.len(), 2);
+    assert!(root.children.iter().all(|c| c.name == "Pin"));
+    // The second pin sits 20 mm along X from the first.
+    let xs: Vec<f64> = imp
+        .bodies
+        .iter()
+        .filter(|b| b.path.last().is_some_and(|p| p == "Pin"))
+        .map(|b| solidcraft_kernel::measure(&b.body).unwrap().centroid.x)
+        .collect();
+    assert_eq!(xs.len(), 2);
+    assert!(((xs[0] - xs[1]).abs() - 20.0).abs() < 1e-6, "{xs:?}");
+}
+
+/// A face extrude follows its face when earlier features change.
+#[test]
+fn face_extrude_follows_edits() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 40, "width": 30, "height": 20, "name": "Base"}));
+    run(&mut s, "solid.extrude", json!({"face": [20, 15, 20], "distance": 10, "operation": "join", "name": "Pad"}));
+    assert!(rel(volume(&mut s), 40.0 * 30.0 * 30.0) < 1e-6);
+    run(&mut s, "timeline.edit", json!({"feature": "Base", "set": {"height": "25", "length": "50"}}));
+    assert!(rel(volume(&mut s), 50.0 * 30.0 * 35.0) < 1e-6, "{}", volume(&mut s));
+    // A face revolved about a line: Pappus (area × centroid path).
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 40, "width": 30, "height": 20}));
+    let before = volume(&mut s);
+    run(
+        &mut s,
+        "solid.revolve",
+        json!({"face": [40, 15, 10], "axis": {"origin": [40, 0, 30], "dir": [0, 1, 0]}, "angle": "90 deg", "operation": "new"}),
+    );
+    let added = volume(&mut s) - before;
+    let want = 30.0 * 20.0 * 20.0 * PI / 2.0;
+    assert!(rel(added, want) < 1e-4, "{added} vs {want}");
+}
+
+/// Appearances on faces, bodies and components: face > body > component > material.
+#[test]
+fn appearances_by_face_body_and_component() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 10, "width": 10, "height": 10, "body_name": "Root"}));
+    run(&mut s, "component.create", json!({"name": "Case"}));
+    run(&mut s, "solid.box", json!({"corner": [20, 0, 0], "length": 10, "width": 10, "height": 10, "body_name": "Shell"}));
+    run(&mut s, "component.activate", json!({"component": "root"}));
+    let lib = run(&mut s, "appearance.library", json!({}));
+    assert!(lib["appearances"].as_array().is_some_and(|a| a.len() >= 15 && a.iter().any(|x| x["name"] == "Glass - Clear")));
+    let look = |s: &mut Session, b: &str| run(s, "appearance.list", json!({"body": b}))["body"].clone();
+    // Material, then component, then body.
+    run(&mut s, "material.assign", json!({"bodies": ["Shell"], "material": "Brass"}));
+    assert_eq!(look(&mut s, "Shell")["appearance"]["name"], "Brass");
+    run(&mut s, "appearance.assign", json!({"components": ["Case"], "appearance": "ABS - Blue"}));
+    assert_eq!(look(&mut s, "Shell")["appearance"]["name"], "ABS - Blue");
+    assert!(look(&mut s, "Root")["appearance"].is_null(), "root bodies have no component look");
+    run(&mut s, "appearance.assign", json!({"bodies": ["Shell"], "color": [255, 0, 0], "opacity": 0.5}));
+    let l = look(&mut s, "Shell");
+    assert_eq!((l["appearance"]["color"].as_str(), l["appearance"]["opacity"].as_f64()), (Some("#ff0000"), Some(0.5)), "{l}");
+    // A face: the top of Shell.
+    run(&mut s, "appearance.assign", json!({"faces": [[25, 5, 10]], "appearance": "Glass - Clear"}));
+    let l = look(&mut s, "Shell");
+    let faces = l["faces"].as_array().cloned().unwrap_or_default();
+    assert_eq!(faces.len(), 1, "{l}");
+    assert_eq!(faces[0]["appearance"]["name"], "Glass - Clear");
+    // Clearing goes back down the chain.
+    run(&mut s, "appearance.assign", json!({"faces": [[26, 6, 10]]}));
+    assert_eq!(look(&mut s, "Shell")["faces"].as_array().map(Vec::len), Some(0), "cleared by another point on the same face");
+    run(&mut s, "appearance.assign", json!({"bodies": ["Shell"], "color": null}));
+    assert_eq!(look(&mut s, "Shell")["appearance"]["name"], "ABS - Blue");
+    run(&mut s, "appearance.assign", json!({"components": ["Case"]}));
+    assert_eq!(look(&mut s, "Shell")["appearance"]["name"], "Brass");
+    // Saved and opened again.
+    run(&mut s, "appearance.assign", json!({"faces": [[5, 5, 10]], "color": "#00ff00"}));
+    let back = solidcraft_doc::Document::from_json(&s.doc.to_json()).unwrap();
+    assert_eq!(back.appearances, s.doc.appearances);
+    assert!(s.execute("appearance.assign", &json!({"bodies": ["Shell"], "appearance": "Unobtainium"})).is_err());
+    assert!(s.execute("appearance.assign", &json!({"color": "#ffffff"})).is_err(), "no target");
+    assert!(s.execute("appearance.assign", &json!({"faces": [[500, 500, 500]], "color": "#ffffff"})).is_err(), "no face there");
+}
+
+/// The evaluation cache gives exactly what evaluating from scratch gives, through edits,
+/// suppression, roll-back, undo and redo.
+#[test]
+fn cached_evaluation_matches_from_scratch() {
+    let mut s = Session::default();
+    s.run_script(&crate::sample::script()).unwrap();
+    run(
+        &mut s,
+        "solid.pattern.rectangular",
+        json!({"bodies": ["Plate"], "dir1": [1, 0, 0], "count1": 3, "spacing1": 100, "dir2": [0, 1, 0], "count2": 2, "spacing2": 70}),
+    );
+    run(&mut s, "solid.box", json!({"corner": [-50, 0, 0], "length": 10, "width": 10, "height": 10, "body_name": "Side"}));
+    let same = |s: &Session, what: &str| {
+        let mut fresh = solidcraft_doc::Model::new();
+        fresh.no_cache = true;
+        fresh.evaluate(&s.doc);
+        let errs = |m: &solidcraft_doc::Model| m.results.iter().map(|r| (r.id, r.error.clone(), r.skipped)).collect::<Vec<_>>();
+        assert_eq!(errs(&s.model), errs(&fresh), "{what}: feature results");
+        let shape = |st: &solidcraft_doc::ModelState| {
+            st.bodies
+                .iter()
+                .map(|b| {
+                    let m = solidcraft_kernel::measure(&b.body).unwrap();
+                    // Volume and area to 1e-9: two evaluations from scratch differ in the last
+                    // bits too (the kernel's tessellation is not bit-for-bit repeatable).
+                    (b.name.clone(), b.feature, (m.volume * 1e6).round(), (m.area * 1e6).round(), m.faces, m.edges, m.vertices, m.merged.faces)
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(shape(&s.model.state()), shape(&fresh.state()), "{what}: bodies");
+        assert_eq!(s.model.state().sketches.len(), fresh.state().sketches.len(), "{what}: sketches");
+    };
+    // Two evaluations from scratch agree to the same precision.
+    let mut a = solidcraft_doc::Model::new();
+    a.no_cache = true;
+    a.evaluate(&s.doc);
+    let mut b = solidcraft_doc::Model::new();
+    b.no_cache = true;
+    b.evaluate(&s.doc);
+    let vols = |m: &solidcraft_doc::Model| {
+        m.state().bodies.iter().map(|x| (solidcraft_kernel::measure(&x.body).unwrap().volume * 1e6).round()).collect::<Vec<_>>()
+    };
+    assert_eq!(vols(&a), vols(&b));
+    same(&s, "built");
+    let hits = |s: &Session| s.model.cache.lock().map(|c| c.hits).unwrap_or(0);
+    for (step, (id, p)) in [
+        ("parameters.change", json!({"name": "width", "expression": "90 mm"})),
+        ("parameters.change", json!({"name": "width", "expression": "80 mm"})),
+        ("parameters.change", json!({"name": "thickness", "expression": "10 mm"})),
+        ("edit.undo", json!({})),
+        ("edit.redo", json!({})),
+        ("timeline.suppress", json!({"feature": "Holes", "suppressed": true})),
+        ("timeline.suppress", json!({"feature": "Holes", "suppressed": false})),
+        ("timeline.roll_to", json!({"position": 6})),
+        ("timeline.roll_to", json!({})),
+        ("edit.undo", json!({})),
+        ("edit.undo", json!({})),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let before = hits(&s);
+        run(&mut s, id, p.clone());
+        same(&s, &format!("step {step}: {id} {p}"));
+        // Setting the width back solves the sketch again from its current state; the
+        // features after it see the same geometry and reuse their results. So does undo.
+        if step == 1 || step == 3 {
+            assert!(hits(&s) > before, "step {step} reuses the earlier results");
+        }
+    }
+}
+
+/// A sketch on a plane turned about a model edge follows the edge when a parameter moves it: the
+/// cache must not take the turned plane as fixed because its base plane is.
+#[test]
+fn a_sketch_on_a_plane_turned_about_a_model_edge_follows_it_after_a_change() {
+    let mut s = Session::default();
+    run(&mut s, "parameters.add", json!({"name": "cx", "expression": "40 mm"}));
+    run(&mut s, "solid.cylinder", json!({"base": ["cx", 0, 0], "radius": 5, "height": 10, "body_name": "Shaft"}));
+    run(&mut s, "sketch.create", json!({"plane": "XZ", "name": "Profile"}));
+    run(&mut s, "sketch.rectangle.two_point", json!({"p0": [46, -2], "p1": [48, -8]}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "construct.plane.at_angle", json!({"base": "XZ", "axis": {"face": [45, 0, 5]}, "angle": "30 deg", "name": "Turned"}));
+    let turned = s
+        .doc
+        .features
+        .iter()
+        .find_map(|f| match &f.kind {
+            solidcraft_doc::FeatureKind::ConstructionPlane { plane } if f.name == "Turned" => Some(plane.clone()),
+            _ => None,
+        })
+        .unwrap();
+    assert!(matches!(turned, solidcraft_doc::PlaneRef::AtAngle { line: Some(_), .. }), "{turned:?}");
+    run(&mut s, "solid.extrude", json!({"sketch": "Profile", "distance": 2, "operation": "new", "name": "Fin"}));
+    let id = s.doc.find_feature("Profile").unwrap().id;
+    if let Some(solidcraft_doc::FeatureKind::Sketch { plane, .. }) = s.doc_mut().feature_mut(id).map(|f| &mut f.kind) {
+        *plane = turned;
+    }
+    s.refresh();
+    let same = |s: &Session, what: &str| {
+        let mut fresh = solidcraft_doc::Model::new();
+        fresh.no_cache = true;
+        fresh.evaluate(&s.doc);
+        assert!(fresh.results.iter().all(|r| r.error.is_none()), "{what}");
+        assert!(s.model.results.iter().all(|r| r.error.is_none()), "{what}");
+        let shape = |st: &solidcraft_doc::ModelState| {
+            let mut v = st
+                .bodies
+                .iter()
+                .map(|b| {
+                    let m = solidcraft_kernel::measure(&b.body).unwrap();
+                    let c = [m.centroid.x, m.centroid.y, m.centroid.z].map(|v| (v * 1e6).round());
+                    (b.name.clone(), (m.volume * 1e6).round(), c, m.faces)
+                })
+                .collect::<Vec<_>>();
+            v.sort_by(|a, b| a.0.cmp(&b.0));
+            v
+        };
+        assert_eq!(shape(&s.model.state()), shape(&fresh.state()), "{what}");
+    };
+    same(&s, "made");
+    for cx in ["40.5 mm", "41 mm", "40 mm"] {
+        run(&mut s, "parameters.change", json!({"name": "cx", "expression": cx}));
+        same(&s, &format!("cx = {cx}"));
+    }
+}
+
+/// A fillet keeps its edge when an earlier sketch dimension resizes the body (QA s06).
+#[test]
+fn fillet_follows_its_edge_after_an_upstream_resize() {
+    let mut s = Session::default();
+    run(&mut s, "sketch.create", json!({"plane": "XY", "name": "S"}));
+    let r = run(&mut s, "sketch.rectangle.two_point", json!({"p0": [0, 0], "p1": [40, 30]}));
+    let bottom = r["curves"][0].as_str().unwrap_or_default().to_string();
+    let d = run(&mut s, "sketch.dimension", json!({"entities": [bottom], "value": 40}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "solid.extrude", json!({"distance": 10}));
+    run(&mut s, "solid.fillet", json!({"edges": [[40, 15, 10]], "radius": 2}));
+    let v = |s: &mut Session| run(s, "inspect.measure", json!({}))["total"]["volume_mm3"].as_f64().unwrap_or(0.0);
+    let strip = (4.0 - std::f64::consts::PI) * 30.0;
+    assert!((v(&mut s) - (12000.0 - strip)).abs() < 0.05, "{}", v(&mut s));
+    let name = d["param"].as_str().or_else(|| d["name"].as_str()).map(str::to_string).unwrap_or_else(|| "d1".into());
+    run(&mut s, "parameters.change", json!({"name": name, "expression": "60"}));
+    // The right top edge, now at x = 60: 18000 less the same 30 mm strip.
+    assert!((v(&mut s) - (18000.0 - strip)).abs() < 0.05, "{}", v(&mut s));
+    let fillet = s.doc.features.last().map(|f| f.id).unwrap_or(0);
+    assert!(s.model.result(fillet).and_then(|r| r.warning.clone()).is_none(), "followed without a warning");
+}
+
+mod naming {
+    use serde_json::{Value, json};
+    use solidcraft_geom::MeshGeom;
+
+    use super::run;
+    use crate::Session;
+
+    fn volume(s: &mut Session) -> f64 {
+        run(s, "inspect.measure", json!({}))["total"]["volume_mm3"].as_f64().unwrap_or(0.0)
+    }
+
+    fn warning(s: &Session, name: &str) -> Option<String> {
+        let id = s.doc.find_feature(name).map(|f| f.id)?;
+        s.model.result(id).and_then(|r| r.warning.clone())
+    }
+
+    /// The reference feature `name` failed on, asking for it to be picked again.
+    fn reselect(s: &Session, name: &str) -> Option<String> {
+        let id = s.doc.find_feature(name).map(|f| f.id)?;
+        let error = s.model.result(id).and_then(|r| r.error.clone())?;
+        solidcraft_doc::reselect_parts(&error).filter(|(feature, _)| *feature == name).map(|(_, reference)| reference.to_string())
+    }
+
+    /// A 40 x 30 x 10 block (sketch S: l1…l4 counter-clockwise from the origin), a hole H, a
+    /// fillet on the right top edge.
+    fn block() -> Session {
+        let mut s = Session::default();
+        run(&mut s, "sketch.create", json!({"plane": "XY", "name": "S"}));
+        run(&mut s, "sketch.rectangle.two_point", json!({"p0": [0, 0], "p1": [40, 30]}));
+        run(&mut s, "sketch.dimension", json!({"entities": ["l1"], "value": 40}));
+        run(&mut s, "sketch.finish", json!({}));
+        run(&mut s, "solid.extrude", json!({"distance": 10, "name": "Block"}));
+        run(&mut s, "sketch.create", json!({"plane": "XY", "name": "H"}));
+        run(&mut s, "sketch.circle.center", json!({"center": [12, 15], "radius": 4}));
+        run(&mut s, "sketch.finish", json!({}));
+        run(&mut s, "solid.extrude", json!({"sketch": "H", "distance": 10, "operation": "cut", "name": "Hole"}));
+        run(&mut s, "solid.fillet", json!({"edges": [[40, 15, 10]], "radius": 2, "name": "Round"}));
+        s
+    }
+
+    const STRIP: f64 = (4.0 - std::f64::consts::PI) * 30.0;
+
+    #[test]
+    fn faces_and_edges_are_named_from_their_history() {
+        let mut s = block();
+        let f = run(&mut s, "model.faces", json!({"body": "Body1"}));
+        let names: Vec<&str> = f["faces"].as_array().into_iter().flatten().filter_map(|x| x["name"].as_str()).collect();
+        for want in ["F2:start", "F2:top", "F2:side:l1", "F2:side:l2", "F2:side:l3", "F2:side:l4"] {
+            assert!(names.contains(&want), "{want} in {names:?}");
+        }
+        assert!(names.iter().any(|n| n.starts_with("F4:side:c1")), "{names:?}");
+        assert!(names.iter().any(|n| n.starts_with("F5:blend(")), "{names:?}");
+        let round = s.doc.find_feature("Round").cloned().unwrap();
+        assert_eq!(round.edge_names, vec!["F2:side:l2|F2:top".to_string()]);
+    }
+
+    #[test]
+    fn a_resize_keeps_the_edge() {
+        let mut s = block();
+        let d = s.doc.find_feature("S").and_then(|f| f.param_names.first().cloned()).unwrap_or_else(|| "d1".into());
+        run(&mut s, "parameters.change", json!({"name": d, "expression": "60"}));
+        assert!((volume(&mut s) - (18000.0 - std::f64::consts::PI * 16.0 * 10.0 - STRIP)).abs() < 0.1, "{}", volume(&mut s));
+        assert_eq!(warning(&s, "Round"), None);
+    }
+
+    #[test]
+    fn suppress_and_reorder_upstream_keep_the_edge() {
+        let mut s = block();
+        let v = volume(&mut s);
+        run(&mut s, "timeline.suppress", json!({"feature": "Hole", "suppressed": true}));
+        assert!((volume(&mut s) - (12000.0 - STRIP)).abs() < 0.1);
+        assert_eq!(warning(&s, "Round"), None);
+        run(&mut s, "timeline.suppress", json!({"feature": "Hole", "suppressed": false}));
+        assert!((volume(&mut s) - v).abs() < 1e-6);
+        // The hole after the fillet: same part, same edge.
+        run(&mut s, "timeline.reorder", json!({"feature": "Hole", "position": 4}));
+        assert!((volume(&mut s) - v).abs() < 0.1, "{} {v}", volume(&mut s));
+        assert_eq!(warning(&s, "Round"), None);
+    }
+
+    /// A notch through the right face, `p0` to `p1` on the top.
+    fn notch(s: &mut Session, p0: [f64; 2], p1: [f64; 2]) {
+        run(s, "sketch.create", json!({"plane": "XY", "name": "N"}));
+        run(s, "sketch.rectangle.two_point", json!({"p0": p0, "p1": p1}));
+        run(s, "sketch.finish", json!({}));
+        run(s, "solid.extrude", json!({"sketch": "N", "distance": 10, "operation": "cut", "name": "Notch"}));
+    }
+
+    /// The notch leaves the filleted edge in two pieces: neither is the edge, so the fillet fails,
+    /// asking for its edge again, and never rounds the piece nearest the pick.
+    #[test]
+    fn a_split_edge_fails_the_fillet_asking_for_the_edge_again() {
+        let mut s = block();
+        run(&mut s, "timeline.roll_to", json!({"feature": "Hole"}));
+        notch(&mut s, [36.0, 12.0], [44.0, 18.0]);
+        run(&mut s, "timeline.roll_to", json!({}));
+        assert_eq!(reselect(&s, "Round").as_deref(), Some("F2:side:l2|F2:top"));
+    }
+
+    /// A fillet on a piece of a split edge, its notch then suppressed: the edge is whole again, and
+    /// its piece's name doesn't stand for all of it, so the fillet fails, asking for its edge again.
+    #[test]
+    fn a_pieces_name_on_the_whole_edge_again_fails_asking_for_the_edge() {
+        let mut s = block();
+        run(&mut s, "timeline.delete", json!({"features": ["Round"]}));
+        notch(&mut s, [36.0, 12.0], [44.0, 18.0]);
+        run(&mut s, "solid.fillet", json!({"edges": [[40, 24, 10]], "radius": 2, "name": "Piece"}));
+        let named = s.doc.find_feature("Piece").map(|f| f.edge_names.clone()).unwrap_or_default();
+        assert!(!named.is_empty() && named.iter().all(|n| n.contains('#')), "a piece's name: {named:?}");
+        assert_eq!(warning(&s, "Piece"), None);
+        run(&mut s, "timeline.suppress", json!({"feature": "Notch", "suppressed": true}));
+        assert!(reselect(&s, "Piece").is_some(), "{:?}", warning(&s, "Piece"));
+        let unrounded = 12000.0 - std::f64::consts::PI * 160.0;
+        assert!((volume(&mut s) - unrounded).abs() < 0.1, "{} {unrounded}", volume(&mut s));
+    }
+
+    /// The face the filleted edge bounded is gone with its sketch line: the fillet fails, asking
+    /// for its edge again.
+    #[test]
+    fn a_removed_segment_fails_the_fillet_asking_for_the_edge_again() {
+        let mut s = block();
+        // Replace the right side (l2) of the rectangle with a new line: the face it made is gone.
+        let sk = s.doc.find_feature("S").map(|f| f.id).unwrap();
+        run(&mut s, "sketch.edit", json!({"sketch": sk}));
+        run(&mut s, "sketch.delete", json!({"entities": ["l2"]}));
+        run(&mut s, "sketch.line", json!({"points": [[40, 0], [40, 30]], "ids": ["right"]}));
+        let r: Result<Value, _> = s.execute("sketch.finish", &json!({}));
+        assert!(r.is_ok() || r.is_err());
+        assert_eq!(reselect(&s, "Round").as_deref(), Some("F2:side:l2|F2:top"));
+    }
+
+    fn face_names(s: &mut Session, body: &str) -> Vec<String> {
+        let f = run(s, "model.faces", json!({ "body": body }));
+        f["faces"].as_array().into_iter().flatten().filter_map(|x| x["name"].as_str().map(str::to_string)).collect()
+    }
+
+    #[test]
+    fn primitives_revolves_and_pattern_copies_are_named() {
+        let mut s = Session::default();
+        run(&mut s, "solid.box", json!({"length": 10, "width": 10, "height": 10, "body_name": "B"}));
+        let n = face_names(&mut s, "B");
+        for want in ["F1:+x", "F1:-x", "F1:+y", "F1:-y", "F1:+z", "F1:-z"] {
+            assert!(n.contains(&want.to_string()), "{want} in {n:?}");
+        }
+        run(&mut s, "solid.pattern.rectangular", json!({"bodies": ["B"], "dir1": [1, 0, 0], "count1": 3, "spacing1": 20}));
+        let bodies: Vec<String> = s.model.state().bodies.iter().map(|b| b.name.clone()).collect();
+        let copy = face_names(&mut s, &bodies[2]);
+        assert!(copy.iter().all(|x| x.starts_with("F1:") && x.contains("@F2.")), "{copy:?}");
+        // A revolved ring: the section's four lines name the four faces.
+        let mut r = Session::default();
+        run(&mut r, "sketch.create", json!({"plane": "XZ"}));
+        run(&mut r, "sketch.line", json!({"points": [[10, 0], [15, 0], [15, 5], [10, 5]], "closed": true, "ids": ["a", "b", "c", "d"]}));
+        run(&mut r, "sketch.finish", json!({}));
+        run(&mut r, "solid.revolve", json!({"axis": "y", "angle": "270 deg"}));
+        let body = r.model.state().bodies[0].name.clone();
+        let n = face_names(&mut r, &body);
+        for want in ["F2:side:a", "F2:side:b", "F2:side:c", "F2:side:d", "F2:start", "F2:end"] {
+            assert!(n.iter().any(|x| x.starts_with(want)), "{want} in {n:?}");
+        }
+    }
+
+    #[test]
+    fn a_sketch_on_a_face_stays_on_that_face() {
+        let mut s = Session::default();
+        run(&mut s, "sketch.create", json!({"plane": "XY", "name": "S"}));
+        run(&mut s, "sketch.rectangle.two_point", json!({"p0": [0, 0], "p1": [40, 30]}));
+        run(&mut s, "sketch.finish", json!({}));
+        run(&mut s, "solid.extrude", json!({"distance": 10, "name": "Block"}));
+        run(&mut s, "sketch.create", json!({"plane": {"face": [30, 15, 10]}, "name": "Top"}));
+        run(&mut s, "sketch.circle.center", json!({"center": [30, 15], "radius": 3}));
+        run(&mut s, "sketch.finish", json!({}));
+        run(&mut s, "solid.extrude", json!({"sketch": "Top", "distance": 5, "operation": "join", "name": "Peg"}));
+        let top = |s: &mut Session| run(s, "inspect.measure", json!({}))["bodies"][0]["bbox"]["max"][2].as_f64().unwrap_or(0.0);
+        assert!((top(&mut s) - 15.0).abs() < 1e-6);
+        let attached = |s: &Session| s.model.state().sketch(s.doc.find_feature("Top").unwrap().id).map(|sketch| sketch.plane.origin.z);
+        assert_eq!(attached(&s), Some(10.));
+        run(&mut s, "timeline.edit", json!({"feature":"Block","set":{"extent":{"distance":"12"}}}));
+        assert_eq!(attached(&s), Some(12.));
+        assert!((top(&mut s) - 17.).abs() < 1e-6);
+        run(&mut s, "edit.undo", json!({}));
+        assert_eq!(attached(&s), Some(10.));
+        assert!((top(&mut s) - 15.).abs() < 1e-6);
+        let reopened = solidcraft_doc::Document::from_json(&s.doc.to_json()).unwrap();
+        let mut model = solidcraft_doc::Model::new();
+        model.evaluate(&reopened);
+        assert_eq!(model.state().sketch(reopened.find_feature("Top").unwrap().id).unwrap().plane.origin.z, 10.);
+        assert!((model.state().bodies[0].mesh().bounds().max.z - 15.).abs() < 1e-6);
+        // A format-10 attachment has only the face name that build worked out from geometry, and
+        // no strong anchor: that name finds no face today. The sketch fails, asking for its face
+        // again, and so does the peg on it; the block builds.
+        let mut old = (*s.doc).clone();
+        let solidcraft_doc::FeatureKind::Sketch { plane: solidcraft_doc::PlaneRef::Face { anchor, name, .. }, sketch } =
+            &mut old.features.iter_mut().find(|f| f.name == "Top").unwrap().kind
+        else {
+            panic!("fixture must contain a face sketch");
+        };
+        *anchor = None;
+        let saved = name.clone().unwrap();
+        for link in &mut sketch.links {
+            if link.auto_face {
+                link.auto_face = false;
+                link.face_name = name.clone();
+            }
+        }
+        old.format = "solidcraft/10".into();
+        let legacy = Session::new(solidcraft_doc::Document::from_json(&old.to_json()).unwrap());
+        let error = |s: &Session, name: &str| s.model.results.iter().find(|r| r.id == s.doc.find_feature(name).unwrap().id).unwrap().error.clone();
+        let reference = format!("{}{saved}", solidcraft_doc::naming::LEGACY_MARK);
+        assert_eq!(error(&legacy, "Top").as_deref().and_then(solidcraft_doc::reselect_parts), Some(("Top", reference.as_str())));
+        assert!(error(&legacy, "Peg").is_some());
+        assert!(error(&legacy, "Block").is_none());
+        // An upstream join that trims the certified face: the attachment stays on what is left
+        // of it and never follows the substitute roof (see face_tests for a face covered whole).
+        run(&mut s, "timeline.roll_to", json!({"feature": "Block"}));
+        run(&mut s, "sketch.create", json!({"plane": "XY", "name": "B"}));
+        run(&mut s, "sketch.rectangle.two_point", json!({"p0": [8, -5], "p1": [45, 35]}));
+        run(&mut s, "sketch.finish", json!({}));
+        run(&mut s, "solid.extrude", json!({"sketch": "B", "distance": 20, "operation": "join", "name": "Boss"}));
+        run(&mut s, "timeline.roll_to", json!({}));
+        let failed = |s: &Session, name: &str| s.model.results.iter().find(|r| r.id == s.doc.find_feature(name).unwrap().id).unwrap().error.is_some();
+        assert!(!failed(&s, "Top"));
+        assert!(!failed(&s, "Peg"));
+        assert_eq!(attached(&s), Some(10.), "the strip of Block's top left beside the boss is still that face");
+        assert!((top(&mut s) - 20.0).abs() < 1e-6, "{}", top(&mut s));
+        run(&mut s, "timeline.suppress", json!({"feature":"Boss","suppressed":true}));
+        assert!(!failed(&s, "Top"));
+        assert_eq!(attached(&s), Some(10.));
+        assert!((top(&mut s) - 15.).abs() < 1e-6);
+    }
+
+    #[test]
+    fn shell_inner_faces_are_named_after_the_walls() {
+        let mut s = Session::default();
+        run(&mut s, "solid.box", json!({"length": 40, "width": 30, "height": 20, "body_name": "B"}));
+        run(&mut s, "solid.shell", json!({"faces": [[20, 15, 20]], "thickness": 2}));
+        let n = face_names(&mut s, "B");
+        for want in ["F2:inner(F1:-z)", "F2:inner(F1:+x)", "F2:inner(F1:-x)", "F2:inner(F1:+y)", "F2:inner(F1:-y)"] {
+            assert!(n.contains(&want.to_string()), "{want} in {n:?}");
+        }
+    }
+
+    #[test]
+    fn shell_and_hole_faces_follow_by_name() {
+        let mut s = Session::default();
+        run(&mut s, "solid.box", json!({"length": 40, "width": 30, "height": 20, "name": "Base"}));
+        run(&mut s, "solid.shell", json!({"faces": [[20, 15, 20]], "thickness": 2, "name": "Hollow"}));
+        let shell = |h: f64| 40.0 * 30.0 * h - 36.0 * 26.0 * (h - 2.0);
+        assert!((volume(&mut s) - shell(20.0)).abs() < 0.5, "{}", volume(&mut s));
+        // Taller: the picked point is 5 mm under the open face now; its name still finds it.
+        run(&mut s, "timeline.edit", json!({"feature": "Base", "set": {"height": "25"}}));
+        assert!((volume(&mut s) - shell(25.0)).abs() < 0.5, "{}", volume(&mut s));
+        assert_eq!(warning(&s, "Hollow"), None);
+        let h = s.doc.find_feature("Hollow").map(|f| f.face_names.clone()).unwrap_or_default();
+        assert_eq!(h, vec!["F1:+z".to_string()]);
+    }
+}
+
+/// Tapped holes take the tap drill (major − pitch); clearance holes the ISO 273 diameter.
+#[test]
+fn tapped_and_clearance_holes() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 40, "width": 30, "height": 10}));
+    let v0 = volume(&mut s);
+    run(&mut s, "solid.hole", json!({"position": [10, 15, 10], "thread": "M6"}));
+    let v1 = volume(&mut s);
+    assert!(rel(v0 - v1, PI * 2.5 * 2.5 * 10.0) < 1e-3, "{}", v0 - v1);
+    run(&mut s, "solid.hole", json!({"position": [30, 15, 10], "clearance": "M6"}));
+    let v2 = volume(&mut s);
+    assert!(rel(v1 - v2, PI * 3.3 * 3.3 * 10.0) < 1e-3, "{}", v1 - v2);
+    run(&mut s, "solid.hole", json!({"position": [20, 5, 10], "clearance": "M4", "fit": "close"}));
+    assert!(rel(v2 - volume(&mut s), PI * 2.15 * 2.15 * 10.0) < 1e-3);
+    assert!(s.execute("solid.hole", &json!({"position": [20, 25, 10], "clearance": "M7"})).is_err());
+    assert!(s.execute("solid.hole", &json!({"position": [20, 25, 10]})).is_err());
+}
+
+/// A counterbore sized to the screw's head: `head` names the standard and `clearance` the size.
+/// ISO 4762 M4 has dk 7 and k 4; with the default 0.5 mm gap the recess is Ø8, 4.5 deep.
+#[test]
+fn counterbore_for_a_cap_screw_head() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 80, "width": 30, "height": 10}));
+    let v0 = volume(&mut s);
+    // The material a through hole of diameter `hole` with a counterbore `dk` wide and `k` deep removes.
+    let removed = |hole: f64, dk: f64, k: f64| PI * hole * hole / 4.0 * (10.0 - k) + PI * dk * dk / 4.0 * k;
+    let recess = |s: &Session| match s.doc.features.last().map(|f| &f.kind) {
+        Some(solidcraft_doc::FeatureKind::Hole { hole: solidcraft_doc::HoleKind::Counterbore { cb_diameter, cb_depth, .. }, .. }) => {
+            (cb_diameter.as_str().to_string(), cb_depth.as_str().to_string())
+        }
+        other => panic!("not a counterbore: {other:?}"),
+    };
+    run(&mut s, "solid.hole", json!({"position": [10, 15, 10], "clearance": "M4", "head": "ISO 4762"}));
+    let v1 = volume(&mut s);
+    assert!(rel(v0 - v1, removed(4.5, 8.0, 4.5)) < 1e-3, "{}", v0 - v1);
+    assert_eq!(recess(&s), ("8 mm".to_string(), "4.5 mm".to_string()));
+    // A button head (ISO 7380-1 M4: dk 7.6, k 2.2), a closer gap, and the depth given by hand.
+    run(&mut s, "solid.hole", json!({"position": [30, 15, 10], "clearance": "M4", "head": "ISO 7380-1", "head_gap": 0.25, "cb_depth": 3}));
+    let v2 = volume(&mut s);
+    assert!(rel(v1 - v2, removed(4.5, 8.1, 3.0)) < 1e-3, "{}", v1 - v2);
+    assert_eq!(recess(&s), ("8.1 mm".to_string(), "3".to_string()));
+    // The family name parts.insert takes, a close fit, the pitch written out, and no gap at all.
+    run(
+        &mut s,
+        "solid.hole",
+        json!({"position": [50, 15, 10], "clearance": "M5x0.8", "fit": "close", "head": "socket_head_cap_screw", "head_gap": "0 mm"}),
+    );
+    let v3 = volume(&mut s);
+    assert!(rel(v2 - v3, removed(5.3, 8.5, 5.0)) < 1e-3, "{}", v2 - v3);
+    // A gap that names a parameter: the recess follows the parameter.
+    run(&mut s, "parameters.add", json!({"name": "gap", "expression": "0.5 mm"}));
+    run(&mut s, "solid.hole", json!({"position": [70, 15, 10], "clearance": "M4", "head": "ISO 4762", "head_gap": "gap"}));
+    let v4 = volume(&mut s);
+    assert!(rel(v3 - v4, removed(4.5, 8.0, 4.5)) < 1e-3, "{}", v3 - v4);
+    assert_eq!(recess(&s), ("7 mm + 2 * (gap)".to_string(), "4 mm + (gap)".to_string()));
+    run(&mut s, "parameters.change", json!({"name": "gap", "expression": "1 mm"}));
+    assert!(rel(v3 - volume(&mut s), removed(4.5, 9.0, 5.0)) < 1e-3);
+}
+
+/// In an inch design, a bare length typed into a feature means inches (stored with the unit);
+/// lengths with units and angles are left alone.
+#[test]
+fn bare_lengths_take_the_design_units() {
+    let mut s = Session::default();
+    s.doc_mut().units = "in".into();
+    run(&mut s, "solid.box", json!({"length": 2, "width": "10 mm", "height": 1}));
+    let m = run(&mut s, "inspect.measure", json!({}));
+    let max = |i: usize| m["bodies"][0]["bbox"]["max"][i].as_f64().unwrap_or(0.0);
+    assert!((max(0) - 50.8).abs() < 1e-9 && (max(1) - 10.0).abs() < 1e-9 && (max(2) - 25.4).abs() < 1e-9, "{m}");
+    let d = s.doc.features[0].param_names[2].clone();
+    run(&mut s, "parameters.change", json!({"name": d, "expression": "2"}));
+    let m = run(&mut s, "inspect.measure", json!({}));
+    assert!((m["bodies"][0]["bbox"]["max"][2].as_f64().unwrap_or(0.0) - 50.8).abs() < 1e-9);
+    assert_eq!(s.doc.features[0].kind.inputs()[2].1, "2 in");
+}
+
+/// Press Pull on a fillet's face changes its radius; on another curved face it offsets it.
+#[test]
+fn press_pull_on_curved_faces() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 40, "width": 30, "height": 20}));
+    run(&mut s, "solid.fillet", json!({"edges": [[40, 0, 10]], "radius": 3, "name": "Round"}));
+    let corner = |r: f64| (4.0 - PI) * r * r / 4.0 * 20.0;
+    assert!(rel(volume(&mut s), 24000.0 - corner(3.0)) < 1e-4);
+    // A point on the fillet: the arc's middle.
+    let c = Vec3::new(37.0, 3.0, 10.0);
+    let on = c + Vec3::new(1.0, -1.0, 0.0).normalized().unwrap() * 3.0;
+    let out = run(&mut s, "solid.press_pull", json!({"face": [on.x, on.y, on.z], "distance": 2}));
+    assert_eq!(out["edited"], "Round", "{out}");
+    assert!(rel(volume(&mut s), 24000.0 - corner(5.0)) < 1e-4, "{}", volume(&mut s));
+    // A hole's wall: pulled along its normal (into the hole), the hole gets smaller.
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 40, "width": 30, "height": 20}));
+    run(&mut s, "solid.hole", json!({"position": [20, 15, 20], "diameter": 10}));
+    let v0 = volume(&mut s);
+    run(&mut s, "solid.press_pull", json!({"face": [25, 15, 10], "distance": 1}));
+    let v1 = volume(&mut s);
+    assert!(rel(v1 - v0, PI * (25.0 - 16.0) * 20.0) < 1e-3, "{v0} {v1}");
+    // A shell's inner wall behind a fillet (`F3:inner(F2:blend(…))`) only names the fillet: it is
+    // offset like any curved face, not taken for the shell's fillet. Pulled 0.5 into the cavity
+    // (radius 3 to 2.5), the wall alone moves, stepping in from its tangent neighbours: the
+    // quarter ring between the radii, 18 high, is added.
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 40, "width": 40, "height": 20}));
+    run(&mut s, "solid.fillet", json!({"edges": [[40, 40, 10]], "radius": 5}));
+    run(&mut s, "solid.shell", json!({"faces": [[20, 20, 20]], "thickness": 2}));
+    let on = Vec3::new(35.0, 35.0, 10.0) + Vec3::new(1.0, 1.0, 0.0).normalized().unwrap() * 3.0;
+    let v0 = volume(&mut s);
+    let out = run(&mut s, "solid.press_pull", json!({"face": [on.x, on.y, on.z], "distance": 0.5}));
+    assert!(out["name"].as_str().is_some_and(|n| n.starts_with("OffsetFace")) && out.get("edited").is_none(), "{out}");
+    let ring = PI / 4.0 * (3.0 * 3.0 - 2.5 * 2.5) * 18.0;
+    // Each volume to the measure's 2e-7.
+    assert!((volume(&mut s) - v0 - ring).abs() < 4e-7 * v0, "{} vs {ring}", volume(&mut s) - v0);
+}
+
+/// #4986: Press Pull on a chamfer's flat face changes the chamfer's distance, as on a fillet's
+/// face it changes the radius, rather than extruding the face.
+#[test]
+fn press_pull_on_a_chamfer_face_edits_the_chamfer() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 40, "width": 30, "height": 20}));
+    run(&mut s, "solid.chamfer", json!({"edges": [[40, 0, 10]], "distance": 3, "name": "Bevel"}));
+    let cut = |d: f64| d * d / 2.0 * 20.0;
+    assert!(rel(volume(&mut s), 24000.0 - cut(3.0)) < 1e-6);
+    // The chamfer's face runs from (37, 0) to (40, 3); its middle.
+    let out = run(&mut s, "solid.press_pull", json!({"face": [38.5, 1.5, 10], "distance": 2}));
+    assert_eq!(out["edited"], "Bevel", "{out}");
+    assert_eq!(s.doc.features.len(), 2, "no extrude added");
+    assert!(rel(volume(&mut s), 24000.0 - cut(5.0)) < 1e-6, "{}", volume(&mut s));
+    // A point on the flat front face 0.02 mm from its edge with the chamfer (which now runs from
+    // (35, 0) to (40, 5)) is the front face's: it is extruded, the chamfer is left alone.
+    let mut t = Session::default();
+    run(&mut t, "solid.box", json!({"length": 40, "width": 30, "height": 20}));
+    run(&mut t, "solid.chamfer", json!({"edges": [[40, 0, 10]], "distance": 3, "name": "Bevel"}));
+    let out = run(&mut t, "solid.press_pull", json!({"face": [36.98, 0, 10], "distance": 1}));
+    assert!(out.get("edited").is_none(), "{out}");
+    assert!(matches!(t.doc.features.last().map(|f| &f.kind), Some(solidcraft_doc::FeatureKind::Extrude { .. })), "an extrude added: {out}");
+    assert!(
+        matches!(&t.doc.features[1].kind, solidcraft_doc::FeatureKind::Chamfer { distance, .. } if distance == "3"),
+        "{:?}",
+        t.doc.features[1].kind
+    );
+    // Too far in (past zero) or too far out: an error, the chamfer as it was.
+    let on = [39.0, 1.0, 10.0];
+    for d in [-10.0, 1e9] {
+        assert!(s.execute("solid.press_pull", &json!({"face": on, "distance": d})).is_err(), "{d}");
+        assert!(rel(volume(&mut s), 24000.0 - cut(5.0)) < 1e-6, "{d}: {}", volume(&mut s));
+    }
+    // An unequal chamfer's first distance changes and its second stays; an angle chamfer keeps
+    // its angle.
+    // Each chamfer's face crosses the corner's bisector at legs a, b: (40 - u, u), u = ab / (a + b).
+    let tan30 = (PI / 6.0).tan();
+    for (extra, u) in [(json!({"distance2": 4}), 8.0 / 6.0), (json!({"angle": "30 deg"}), 2.0 * tan30 / (1.0 + tan30))] {
+        let mut s = Session::default();
+        run(&mut s, "solid.box", json!({"length": 40, "width": 30, "height": 20}));
+        let mut p = json!({"edges": [[40, 0, 10]], "distance": 2, "name": "Bevel"});
+        p.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        run(&mut s, "solid.chamfer", p);
+        let v0 = volume(&mut s);
+        let out = run(&mut s, "solid.press_pull", json!({"face": [40.0 - u, u, 10.0], "distance": 1}));
+        assert_eq!(out["edited"], "Bevel", "{extra}: {out}");
+        assert_eq!(s.doc.features.len(), 2, "{extra}");
+        let Some(solidcraft_doc::FeatureKind::Chamfer { distance2, angle, .. }) = s.doc.features.last().map(|f| &f.kind) else { panic!("{extra}") };
+        assert_eq!(distance2.as_ref().map(|e| e.to_string()), extra.get("distance2").map(|v| v.to_string()), "{extra}");
+        assert_eq!(angle.as_ref().map(|e| e.to_string()), extra.get("angle").and_then(|v| v.as_str()).map(str::to_string), "{extra}");
+        assert!(volume(&mut s) < v0 - 1.0, "{extra}: a bigger chamfer cuts more");
+    }
+}
+
+/// A cut in one component leaves other components' bodies alone unless they are named as
+/// participants; auto join/cut looks at the active component only.
+#[test]
+fn booleans_stay_in_their_component() {
+    let mut s = Session::default();
+    for (name, x) in [("A", 0), ("B", 20)] {
+        run(&mut s, "component.activate", json!({"component": "root"}));
+        run(&mut s, "component.create", json!({"name": name}));
+        run(&mut s, "solid.box", json!({"length": 20, "width": 10, "height": 10, "corner": [x, 0, 0], "body_name": format!("{name}Box")}));
+    }
+    // A's box spans x 0…20, B's x 20…40 (in their own frames, both occurrences in place).
+    run(&mut s, "component.activate", json!({"component": "A"}));
+    run(&mut s, "sketch.create", json!({"plane": "XY", "name": "Slot"}));
+    run(&mut s, "sketch.rectangle.two_point", json!({"p0": [8, 2], "p1": [28, 8]}));
+    run(&mut s, "sketch.finish", json!({}));
+    let vol = |s: &mut Session, b: &str| run(s, "inspect.measure", json!({"bodies": [b]}))["total"]["volume_mm3"].as_f64().unwrap_or(0.0);
+    assert_eq!(auto_operation(&s, &json!({"sketch": "Slot", "distance": 10})).unwrap(), Some("cut"));
+    run(&mut s, "solid.extrude", json!({"sketch": "Slot", "distance": 10, "operation": "cut", "name": "Cut"}));
+    assert!((vol(&mut s, "ABox") - (2000.0 - 12.0 * 6.0 * 10.0)).abs() < 1e-6, "{}", vol(&mut s, "ABox"));
+    assert!((vol(&mut s, "BBox") - 2000.0).abs() < 1e-6, "B untouched: {}", vol(&mut s, "BBox"));
+    // Named as a participant, B is cut too.
+    run(&mut s, "edit.undo", json!({}));
+    run(&mut s, "solid.extrude", json!({"sketch": "Slot", "distance": 10, "operation": "cut", "participants": ["ABox", "BBox"]}));
+    assert!((vol(&mut s, "BBox") - (2000.0 - 8.0 * 6.0 * 10.0)).abs() < 1e-6, "{}", vol(&mut s, "BBox"));
+    assert!(s.execute("solid.extrude", &json!({"sketch": "Slot", "distance": 1, "operation": "cut", "participants": ["Nope"]})).is_err());
+}
+
+/// #1234: a cut sketched in the root, where there is no body, through a body in each of two
+/// components cuts both (the root has nothing of its own to cut). A cut in a component with a
+/// body of its own still stays there (`booleans_stay_in_their_component`).
+#[test]
+fn a_cut_from_a_component_without_bodies_cuts_the_parts_it_meets() {
+    let mut s = Session::default();
+    for (name, x) in [("A", 0), ("B", 30)] {
+        run(&mut s, "component.activate", json!({"component": "root"}));
+        run(&mut s, "component.create", json!({"name": name}));
+        run(&mut s, "solid.box", json!({"length": 20, "width": 10, "height": 10, "corner": [x, 0, 0], "body_name": format!("{name}Box")}));
+    }
+    run(&mut s, "component.activate", json!({"component": "root"}));
+    run(&mut s, "sketch.create", json!({"plane": "XY", "name": "Slot"}));
+    run(&mut s, "sketch.rectangle.two_point", json!({"p0": [10, 2], "p1": [40, 8]}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "solid.extrude", json!({"sketch": "Slot", "distance": 10, "operation": "cut"}));
+    let vol = |s: &mut Session, b: &str| run(s, "inspect.measure", json!({"bodies": [b]}))["total"]["volume_mm3"].as_f64().unwrap_or(0.0);
+    assert!((vol(&mut s, "ABox") - (2000.0 - 10.0 * 6.0 * 10.0)).abs() < 1e-6, "{}", vol(&mut s, "ABox"));
+    assert!((vol(&mut s, "BBox") - (2000.0 - 10.0 * 6.0 * 10.0)).abs() < 1e-6, "{}", vol(&mut s, "BBox"));
+}
+
+/// A unit-less parameter used as a length means the design's units.
+#[test]
+fn unitless_parameters_used_as_lengths_take_the_design_units() {
+    let mut s = Session::default();
+    s.doc_mut().units = "in".into();
+    run(&mut s, "parameters.add", json!({"name": "w", "expression": "2", "unit": ""}));
+    run(&mut s, "solid.box", json!({"length": "w", "width": "w * 1", "height": "10 mm"}));
+    let m = run(&mut s, "inspect.measure", json!({}));
+    let max = |i: usize| m["bodies"][0]["bbox"]["max"][i].as_f64().unwrap_or(0.0);
+    assert!((max(0) - 50.8).abs() < 1e-9 && (max(1) - 50.8).abs() < 1e-9 && (max(2) - 10.0).abs() < 1e-9, "{m}");
+}
+
+/// A chamfer on a tapered pocket survives parameter edits and undo/redo.
+#[test]
+fn chamfer_sloped_basin_rim_recomputes() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 100, "width": 60, "height": 30}));
+    for (name, z, p0, p1) in [("Rim", 30, [20, 4], [80, 50]), ("Floor", 10, [30, 20], [70, 40])] {
+        run(&mut s, "sketch.create", json!({"plane": "XY", "offset": z, "name": name}));
+        run(&mut s, "sketch.rectangle.two_point", json!({"p0": p0, "p1": p1}));
+        run(&mut s, "sketch.finish", json!({}));
+    }
+    run(&mut s, "solid.loft", json!({"sections": [{"sketch": "Rim"}, {"sketch": "Floor"}], "operation": "cut"}));
+    run(&mut s, "parameters.add", json!({"name": "rim_chamfer", "expression": "1 mm"}));
+    let base = volume(&mut s);
+    run(&mut s, "solid.chamfer", json!({"edges": [[50, 4, 30]], "distance": "rim_chamfer"}));
+    let expected = |size: f64| {
+        let wall_slope: f64 = (20.0 - 4.0) / (30.0 - 10.0); // horizontal run / vertical drop
+        let drop = size / (1.0 + wall_slope.powi(2)).sqrt();
+        base - 0.5 * size * drop * (60.0 - drop / 3.0)
+    };
+    assert!(rel(volume(&mut s), expected(1.0)) < 1e-8);
+    let edited = run(&mut s, "parameters.change", json!({"name": "rim_chamfer", "expression": "2 mm"}));
+    assert_eq!(edited["errors"].as_array().unwrap().len(), 0, "{edited}");
+    assert!(rel(volume(&mut s), expected(2.0)) < 1e-8);
+    run(&mut s, "edit.undo", json!({}));
+    assert!(rel(volume(&mut s), expected(1.0)) < 1e-8);
+    run(&mut s, "edit.redo", json!({}));
+    assert!(rel(volume(&mut s), expected(2.0)) < 1e-8);
+}
+
+/// Chamfers with two distances or a distance and an angle.
+#[test]
+fn unequal_chamfers() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 40, "width": 30, "height": 20}));
+    // Top front edge: 2 along the top (the face facing up), 4 down the front.
+    run(&mut s, "solid.chamfer", json!({"edges": [[20, 0, 20]], "distance": 2, "distance2": 4}));
+    assert!(rel(volume(&mut s), 24000.0 - 0.5 * 2.0 * 4.0 * 40.0) < 1e-6, "{}", volume(&mut s));
+    // Bottom back edge: 3 along the bottom, at 30° from it (down the back face 3·tan 30°).
+    run(&mut s, "solid.chamfer", json!({"edges": [[20, 30, 0]], "distance": 3, "angle": "30 deg", "flip": true}));
+    let d2 = 3.0 * (30f64).to_radians().tan();
+    assert!(rel(volume(&mut s), 24000.0 - 160.0 - 0.5 * 3.0 * d2 * 40.0) < 1e-6, "{}", volume(&mut s));
+    assert!(s.execute("solid.chamfer", &json!({"edges": [[0, 15, 20]], "distance": 1, "distance2": 2, "angle": "30 deg"})).is_err());
+}
+
+/// Unequal chamfers of a cylinder's circular rims: each cross-section is a right triangle
+/// revolved about the axis (Pappus: area × the path of its centroid).
+#[test]
+fn unequal_chamfers_on_circular_rims() {
+    use std::f64::consts::PI;
+    let ring = |r: [f64; 3], legs: (f64, f64)| 2.0 * PI * (r[0] + r[1] + r[2]) / 3.0 * 0.5 * legs.0 * legs.1;
+    let mut s = Session::default();
+    run(&mut s, "solid.cylinder", json!({"radius": 10, "height": 20}));
+    // The measured volume is of the meshed cylinder: compare what each chamfer takes away.
+    let full = volume(&mut s);
+    assert!(rel(full, PI * 100.0 * 20.0) < 1e-3);
+    // Top rim: 2 across the top (the face facing up), 3 down the wall.
+    run(&mut s, "solid.chamfer", json!({"edges": [[10, 0, 20]], "distance": 2, "distance2": 3}));
+    let top = ring([10.0, 8.0, 10.0], (2.0, 3.0));
+    assert!(rel(full - volume(&mut s), top) < 5e-3, "{} vs {top}", full - volume(&mut s));
+    // Bottom rim: 2 along the bottom at 30° from it (flipped: the wall would be first).
+    run(&mut s, "solid.chamfer", json!({"edges": [[10, 0, 0]], "distance": 2, "angle": "30 deg", "flip": true}));
+    let d2 = 2.0 * 30f64.to_radians().tan();
+    let bottom = ring([10.0, 8.0, 10.0], (2.0, d2));
+    assert!(rel(full - volume(&mut s), top + bottom) < 5e-3, "{} vs {}", full - volume(&mut s), top + bottom);
+    // Flipped on the top rim instead: 2 down the wall, 3 across the top (a different solid).
+    run(&mut s, "edit.undo", json!({}));
+    run(&mut s, "edit.undo", json!({}));
+    run(&mut s, "solid.chamfer", json!({"edges": [[10, 0, 20]], "distance": 2, "distance2": 3, "flip": true}));
+    let flipped = ring([10.0, 7.0, 10.0], (2.0, 3.0));
+    assert!(rel(full - volume(&mut s), flipped) < 5e-3, "{} vs {flipped}", full - volume(&mut s));
+}
+
+/// A solid box top is not a rim: Lip says to Shell first (#10437).
+#[test]
+fn lip_on_a_solid_box_says_to_shell_first() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 40, "width": 30, "height": 10}));
+    let err = s.execute("plastic.lip", &json!({"face": [20, 15, 10], "width": 1, "height": 2})).unwrap_err().to_string();
+    assert!(err.contains("Shell"), "{err}");
+    assert!(err.contains("rim") || err.contains("opening"), "{err}");
+}
+
+/// An enclosure built in the usual order: shell, bosses, then the lip on the rim.
+#[test]
+fn lip_after_boss() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 80, "width": 50, "height": 30}));
+    run(&mut s, "solid.shell", json!({"faces": [[40, 25, 30]], "thickness": 2}));
+    run(&mut s, "plastic.boss", json!({"position": [10, 10, 2], "diameter": 7, "height": 12, "hole_diameter": 2.5}));
+    run(&mut s, "plastic.boss", json!({"position": [70, 40, 2], "diameter": 7, "height": 12, "hole_diameter": 2.5}));
+    let v0 = volume(&mut s);
+    run(&mut s, "plastic.lip", json!({"face": [1, 25, 30], "width": 1, "height": 2}));
+    // The band inside the rim, 1 wide and 2 high: (78 × 48 − 76 × 46) × 2; the bosses stop
+    // at z = 14, well under it.
+    let inside = (78.0 * 48.0 - 76.0 * 46.0) * 2.0;
+    assert!(rel(volume(&mut s) - v0, inside) < 1e-6, "{}", volume(&mut s) - v0);
+    // Bosses up to the rim, with ribs, against a wall; lips, grooves and outside rims. None
+    // reaches the rim's bands, so each lip adds, and the groove (no gap) takes, its band: the
+    // inside one (78 × 48 − 76 × 46) × 2, the outside one (80 × 50 − 78 × 48) × 2.
+    let bosses = [
+        json!({"position": [15, 15, 2], "diameter": 8, "height": 28, "hole_diameter": 3}),
+        // Ribs out to the inner walls (15 − 4 − 9 = 2), and short of them.
+        json!({"position": [15, 15, 2], "diameter": 8, "height": 12, "ribs": 4, "rib_thickness": 1.5, "rib_length": 9}),
+        json!({"position": [15, 15, 2], "diameter": 8, "height": 12, "ribs": 4, "rib_thickness": 1.5, "rib_length": 6}),
+        json!({"position": [5.5, 25, 2], "diameter": 7, "height": 12, "hole_diameter": 2.5}),
+        json!({"position": [40, 25, 2], "diameter": 8, "height": 20, "draft": "1 deg", "fillet": 1}),
+    ];
+    let outside = (80.0 * 50.0 - 78.0 * 48.0) * 2.0;
+    let lips = [
+        (json!({"face": [1, 25, 30], "width": 1, "height": 2}), inside),
+        (json!({"face": [1, 25, 30], "width": 1, "height": 2, "type": "groove"}), -inside),
+        (json!({"face": [1, 25, 30], "width": 1, "height": 2, "side": "outside"}), outside),
+    ];
+    for (i, b) in bosses.iter().enumerate() {
+        for (j, (l, band)) in lips.iter().enumerate() {
+            let mut s = Session::default();
+            run(&mut s, "solid.box", json!({"length": 80, "width": 50, "height": 30}));
+            run(&mut s, "solid.shell", json!({"faces": [[40, 25, 30]], "thickness": 2}));
+            let r = s.execute("plastic.boss", b);
+            assert!(r.is_ok(), "boss {i}: {r:?}");
+            let v0 = volume(&mut s);
+            let r = s.execute("plastic.lip", l);
+            assert!(r.is_ok(), "boss {i} lip {j}: {r:?}");
+            assert!(rel(volume(&mut s) - v0, *band) < 1e-6, "boss {i} lip {j}: {} vs {band}", volume(&mut s) - v0);
+        }
+    }
+}
+
+/// A lip on a rim with a face elsewhere in line with the pick: a notch under the floor whose
+/// wall lies in the plane y = 25 through the picked point. The pick is the rim's, the face the
+/// point lies on, not the first face whose plane runs through it.
+#[test]
+fn lip_on_a_rim_in_line_with_another_face() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 80, "width": 50, "height": 30}));
+    run(&mut s, "solid.shell", json!({"faces": [[40, 25, 30]], "thickness": 2}));
+    run(&mut s, "solid.box", json!({"length": 20, "width": 10, "height": 1, "corner": [30, 25, 0], "operation": "cut", "targets": ["Body1"]}));
+    let v0 = volume(&mut s);
+    run(&mut s, "plastic.lip", json!({"face": [1, 25, 30], "width": 1, "height": 2}));
+    // The band inside the rim, 1 wide and 2 high: (78 × 48 − 76 × 46) × 2.
+    assert!(rel(volume(&mut s) - v0, 496.0) < 1e-6, "{}", volume(&mut s) - v0);
+}
+
+/// A drilled hole as deep as the plate: the drill point breaks through the bottom.
+#[test]
+fn hole_as_deep_as_the_plate() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 50, "width": 25, "height": 10}));
+    let v0 = volume(&mut s);
+    // The depth is to the drill point's shoulder: the bore, radius 3, runs the plate's 10 and the
+    // point is in the air below it.
+    run(&mut s, "solid.hole", json!({"position": [25, 12.5, 10], "diameter": 6, "depth": 10, "type": "drilled"}));
+    let v = volume(&mut s);
+    assert!((v0 - v - PI * 9.0 * 10.0).abs() < 4e-7 * v0, "{v0} {v}");
+    // Other sizes and places, the defaults, and a tapped hole: each a through bore of its drill,
+    // 10 long. The 8.5 at (12, 6) overlaps the 5 at (10, 10) (√20 apart, under 2.5 + 4.25), so
+    // it takes its bore less the lens they share, 10 long.
+    let (r, q, d) = (2.5f64, 4.25f64, 20f64.sqrt());
+    let lens = r * r * ((d * d + r * r - q * q) / (2.0 * d * r)).acos() + q * q * ((d * d + q * q - r * r) / (2.0 * d * q)).acos()
+        - 0.5 * ((-d + r + q) * (d + r - q) * (d - r + q) * (d + r + q)).sqrt();
+    for (i, (p, cut)) in [
+        (json!({"position": [10, 10, 10], "diameter": 5, "depth": 10, "type": "drilled"}), PI * 6.25 * 10.0),
+        (json!({"position": [40, 15, 10], "diameter": 5, "depth": 10}), PI * 6.25 * 10.0),
+        (json!({"position": [12, 6, 10], "diameter": 8.5, "depth": 10}), (PI * q * q - lens) * 10.0),
+        // M6 × 1: the tap maker's 5.0 drill.
+        (json!({"position": [30, 7, 10], "thread": "M6", "depth": 10}), PI * 6.25 * 10.0),
+        (json!({"position": [20, 18, 10], "diameter": 4, "depth": 10, "tip_angle": 90}), PI * 4.0 * 10.0),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let before = volume(&mut s);
+        let r = s.execute("solid.hole", &p);
+        assert!(r.is_ok(), "{i} {p}: {r:?}");
+        let v = volume(&mut s);
+        assert!((before - v - cut).abs() < 4e-7 * before, "{i} {p}: {} vs {cut}", before - v);
+    }
+}
+
+/// #7520: a hole that names no bodies leaves hidden ones alone, as a cut does (#3961), and keeps
+/// doing so once they are shown again. Its face is named on the body it drills, not on a hidden
+/// one whose face lies in the same plane; with nothing hidden, it still drills every body.
+#[test]
+fn a_hole_leaves_hidden_bodies_alone() {
+    let setup = |hide: bool| {
+        let mut s = Session::default();
+        // Two bodies whose bottom faces share the plane z = 0, the hidden one made first.
+        run(&mut s, "solid.box", json!({"length": 40, "width": 40, "height": 20, "body_name": "Block"}));
+        run(&mut s, "solid.box", json!({"length": 40, "width": 40, "height": 5, "operation": "new", "body_name": "Plate"}));
+        if hide {
+            run(&mut s, "browser.visibility", json!({"items": ["Block"], "visible": false}));
+        }
+        // The name of the plate's face that is picked, before the hole takes the point away.
+        let picked =
+            solidcraft_doc::naming::face_name_at_body(s.world_state().unwrap().body("Plate").unwrap(), solidcore_record::Vec3::new(20.0, 20.0, 0.0));
+        let r = s.execute("solid.hole", &json!({"position": [20, 20, 0], "diameter": 5, "depth": 10, "name": "Hole1"})).unwrap();
+        (s, r, picked)
+    };
+    let vol = |s: &Session, name: &str| solidcraft_kernel::measure(&s.world_state().unwrap().body(name).unwrap().body).unwrap().volume;
+    let (block, plate) = (40.0 * 40.0 * 20.0, 40.0 * 40.0 * 5.0);
+    let (mut hidden, r, picked) = setup(true);
+    assert_eq!(r["changed_bodies"], json!(["Plate"]));
+    assert!((vol(&hidden, "Block") - block).abs() < 1e-6, "the hidden body is not drilled");
+    assert!(vol(&hidden, "Plate") < plate - 1.0, "the shown one is");
+    let hole = hidden.doc.find_feature("Hole1").unwrap();
+    assert!(picked.is_some());
+    assert_eq!((hole.participants.clone(), hole.face_names.first().cloned()), (vec!["Plate".to_string()], picked));
+    run(&mut hidden, "browser.visibility", json!({"items": ["Block"], "visible": true}));
+    assert!((vol(&hidden, "Block") - block).abs() < 1e-6, "shown again, it stays as it was");
+    let (shown, r, _) = setup(false);
+    assert_eq!(r["changed_bodies"], json!(["Block", "Plate"]), "with nothing hidden, both are drilled");
+    assert!(vol(&shown, "Block") < block - 1.0 && vol(&shown, "Plate") < plate - 1.0);
+}
+
+/// #7520 (review): the body whose face is picked is drilled even while it is hidden (picked
+/// through Select Other, or hidden with the dialog open), and editing a hole made with nothing
+/// hidden keeps drilling every body, though one is hidden at the time of the edit.
+#[test]
+fn a_hole_drills_its_picked_body_and_an_edit_keeps_its_scope() {
+    let stack = || {
+        let mut s = Session::default();
+        // Two plates stacked: Lower z 0..5, Upper z 5..10.
+        run(&mut s, "solid.box", json!({"length": 40, "width": 40, "height": 5, "body_name": "Lower"}));
+        run(&mut s, "solid.box", json!({"corner": [0, 0, 5], "length": 40, "width": 40, "height": 5, "operation": "new", "body_name": "Upper"}));
+        s
+    };
+    let vol = |s: &Session, name: &str| solidcraft_kernel::measure(&s.world_state().unwrap().body(name).unwrap().body).unwrap().volume;
+    let plate = 40.0 * 40.0 * 5.0;
+    let hole = |d: f64| json!({"position": [20, 20, 10], "direction": [0, 0, -1], "diameter": d, "depth": 20, "name": "Hole1"});
+
+    // The picked face is on the hidden Upper: it is drilled, and so is the shown Lower below.
+    let mut s = stack();
+    run(&mut s, "browser.visibility", json!({"items": ["Upper"], "visible": false}));
+    let r = s.execute("solid.hole", &hole(5.0)).unwrap();
+    assert_eq!(r["changed_bodies"], json!(["Lower", "Upper"]), "the picked body is drilled though hidden");
+    assert!(vol(&s, "Upper") < plate - 1.0 && vol(&s, "Lower") < plate - 1.0);
+
+    // Made with nothing hidden, then edited with Lower hidden: both stay drilled, at the new size.
+    let mut s = stack();
+    run(&mut s, "solid.hole", hole(5.0));
+    let small = vol(&s, "Lower");
+    assert!(small < plate - 1.0);
+    run(&mut s, "browser.visibility", json!({"items": ["Lower"], "visible": false}));
+    run(
+        &mut s,
+        "timeline.redefine",
+        json!({"feature": "Hole1", "command": "solid.hole", "params": {"position": [20, 20, 10], "direction": [0, 0, -1], "diameter": 6, "depth": 20}}),
+    );
+    assert!(s.doc.find_feature("Hole1").unwrap().participants.is_empty(), "the edit keeps the hole's scope");
+    assert!(vol(&s, "Lower") < small - 1.0, "the hidden Lower keeps its hole, now wider");
+    assert!(vol(&s, "Upper") < small - 1.0);
+}
+
+/// #7520 (history): a hole made with a body hidden stores the bodies it drills, so it replays
+/// the same way: volumes match exactly after a save and reopen, a rebuild from scratch, undo and
+/// redo, showing the hidden body, renaming bodies and editing an earlier feature.
+#[test]
+fn a_hole_made_with_a_hidden_body_replays_the_same() {
+    let build = |plate_height: f64| {
+        let mut s = Session::default();
+        run(&mut s, "solid.box", json!({"length": 40, "width": 40, "height": 20, "body_name": "Block"}));
+        run(&mut s, "solid.box", json!({"length": 40, "width": 40, "height": plate_height, "operation": "new", "body_name": "Plate"}));
+        run(&mut s, "browser.visibility", json!({"items": ["Block"], "visible": false}));
+        run(&mut s, "solid.hole", json!({"position": [20, 20, 0], "diameter": 5, "depth": 3, "name": "Hole1"}));
+        s
+    };
+    let vol = |s: &Session, name: &str| solidcraft_kernel::measure(&s.world_state().unwrap().body(name).unwrap().body).unwrap().volume;
+    // A new session evaluated from the saved text alone, as a rebuild from scratch does.
+    let scratch = |s: &Session| Session::new(solidcraft_doc::Document::from_json(&s.doc.to_json()).unwrap());
+    let s = build(5.0);
+    let (block, plate) = (vol(&s, "Block"), vol(&s, "Plate"));
+    assert_eq!(block, 40.0 * 40.0 * 20.0, "the hidden body is not drilled");
+    assert!(plate < 40.0 * 40.0 * 5.0 - 1.0, "the shown one is");
+    let same = |s: &Session, what: &str| {
+        assert_eq!(vol(s, "Block"), block, "{what}: Block");
+        assert_eq!(vol(s, "Plate"), plate, "{what}: Plate");
+    };
+    // (1) Save and reopen.
+    let dir = std::env::temp_dir().join(format!("solidcraft-hole-history-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("hole.solidcraft");
+    let mut saved = build(5.0);
+    run(&mut saved, "file.save_as", json!({"path": file.to_string_lossy()}));
+    let mut reopened = Session::default();
+    run(&mut reopened, "doc.open", json!({"path": file.to_string_lossy()}));
+    same(&reopened, "reopened");
+    let _ = std::fs::remove_dir_all(&dir);
+    // (2) Rebuild from scratch.
+    same(&scratch(&s), "rebuilt");
+    // (3) Undo and redo.
+    let mut u = build(5.0);
+    run(&mut u, "edit.undo", json!({}));
+    assert_eq!(vol(&u, "Plate"), 40.0 * 40.0 * 5.0, "undone: no hole");
+    run(&mut u, "edit.redo", json!({}));
+    same(&u, "redone");
+    same(&scratch(&u), "redone and rebuilt");
+    // (4) Show the hidden body, then rebuild.
+    let mut shown = build(5.0);
+    run(&mut shown, "browser.visibility", json!({"items": ["Block"], "visible": true}));
+    same(&shown, "shown");
+    same(&scratch(&shown), "shown and rebuilt");
+    // (5) Rename the drilled body (and the hidden one), then rebuild.
+    let mut renamed = build(5.0);
+    run(&mut renamed, "body.rename", json!({"body": "Plate", "name": "Slab"}));
+    run(&mut renamed, "body.rename", json!({"body": "Block", "name": "Core"}));
+    for r in [&renamed, &scratch(&renamed)] {
+        assert_eq!(vol(r, "Slab"), plate, "renamed: Slab");
+        assert_eq!(vol(r, "Core"), block, "renamed: Core");
+    }
+    // (6) Edit an earlier feature (the plate's own box, then the hidden block's), then rebuild:
+    // the same as a design made with the new size from the start.
+    let feature = |s: &Session, body: &str| {
+        let id = s.world_state().unwrap().body(body).unwrap().feature;
+        s.doc.features.iter().find(|f| f.id == id).unwrap().name.clone()
+    };
+    let mut edited = build(5.0);
+    let (plate_box, block_box) = (feature(&edited, "Plate"), feature(&edited, "Block"));
+    run(&mut edited, "timeline.edit", json!({"feature": plate_box, "set": {"height": "8"}}));
+    let fresh = build(8.0);
+    for r in [&edited, &scratch(&edited)] {
+        assert_eq!(vol(r, "Plate"), vol(&fresh, "Plate"), "plate edited");
+        assert_eq!(vol(r, "Block"), block, "plate edited: Block");
+    }
+    run(&mut edited, "timeline.edit", json!({"feature": block_box, "set": {"height": "30"}}));
+    for r in [&edited, &scratch(&edited)] {
+        assert_eq!(vol(r, "Block"), 40.0 * 40.0 * 30.0, "block edited stays undrilled");
+        assert_eq!(vol(r, "Plate"), vol(&fresh, "Plate"), "block edited: Plate");
+    }
+}
+
+/// #7520 (review): with every body hidden, a hole still drills all of them, as before.
+#[test]
+fn a_hole_with_every_body_hidden_drills_them_all() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 40, "width": 40, "height": 20, "body_name": "Block"}));
+    run(&mut s, "solid.box", json!({"length": 40, "width": 40, "height": 5, "operation": "new", "body_name": "Plate"}));
+    run(&mut s, "browser.visibility", json!({"items": ["Block", "Plate"], "visible": false}));
+    let r = s.execute("solid.hole", &json!({"position": [20, 20, 0], "diameter": 5, "depth": 3, "name": "Hole1"})).unwrap();
+    assert_eq!(r["changed_bodies"], json!(["Block", "Plate"]));
+    assert!(s.doc.find_feature("Hole1").unwrap().participants.is_empty());
+}
+
+/// Appearances outlive later features: a coloured face keeps its colour after a fillet on a
+/// neighbouring edge; an imported STEP's body and face colours survive a hole.
+#[test]
+fn appearances_survive_later_features() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 40, "width": 30, "height": 20, "body_name": "B"}));
+    run(&mut s, "appearance.assign", json!({"faces": [[20, 15, 20]], "color": "#ff0000"}));
+    run(&mut s, "solid.fillet", json!({"edges": [[40, 15, 0]], "radius": 3}));
+    let red = |s: &mut Session, body: &str| {
+        let l = run(s, "appearance.list", json!({ "body": body }));
+        l["body"]["faces"].as_array().into_iter().flatten().any(|f| f["appearance"]["color"] == "#ff0000")
+    };
+    assert!(red(&mut s, "B"), "the top face is still red after the fillet");
+    // Exported with a body colour and the red face, then opened: the colours come in as the
+    // body's own; a hole afterwards keeps them.
+    run(&mut s, "appearance.assign", json!({"bodies": ["B"], "color": "#2050c0"}));
+    let dir = std::env::temp_dir().join(format!("solidcraft-paint-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let step = dir.join("painted.step");
+    run(&mut s, "file.export", json!({"path": step.to_string_lossy()}));
+    let mut t = Session::default();
+    run(&mut t, "doc.open", json!({"path": step.to_string_lossy()}));
+    let body = t.model.state().bodies[0].name.clone();
+    let before = t.doc.body_color(&t.model.state().bodies[0]);
+    assert!(before.is_some());
+    run(&mut t, "solid.hole", json!({"position": [10, 10, 20], "diameter": 4}));
+    let st = t.model.state();
+    let b = st.body(&body).unwrap();
+    assert!(b.body.paint().is_none(), "the hole made a new kernel body");
+    assert_eq!(t.doc.body_color(b), before, "the imported body colour carries on");
+    assert!(red(&mut t, &body), "the imported red face carries on");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The original #2 RGB import acceptance, including later topology and placement edits.
+#[test]
+fn imported_rgb_appearances_survive_edits_reopen_and_step_export() {
+    let dir = std::env::temp_dir().join(format!("solidcraft-imported-rgb-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let input = dir.join("rgb.step");
+    let saved = dir.join("edited.solidcraft");
+    let output = dir.join("edited.step");
+    let mut source = Session::default();
+    for (name, x, color) in [("Red", 0, "#ff0000"), ("Green", 40, "#00ff00"), ("Blue", 80, "#0000ff")] {
+        run(&mut source, "solid.box", json!({"corner":[x,0,0],"length":30,"width":20,"height":20,"body_name":name}));
+        run(&mut source, "appearance.assign", json!({"bodies":[name],"color":color}));
+    }
+    run(&mut source, "appearance.assign", json!({"faces":[[15,10,20]],"color":"#ffff00"}));
+    run(&mut source, "file.export", json!({"path":input}));
+    let check = |session: &Session| {
+        let state = session.model.state();
+        assert_eq!(state.bodies.len(), 3);
+        for (name, color) in [("Red", [1., 0., 0.]), ("Green", [0., 1., 0.]), ("Blue", [0., 0., 1.])] {
+            let body = state.body(name).unwrap();
+            assert_eq!(session.doc.body_color(body), Some(color), "{name} retains its imported body colour");
+        }
+        let red = state.body("Red").unwrap();
+        assert!(session.doc.face_colors(red).iter().any(|(_, look)| look.color == [255, 255, 0]), "Red retains its yellow top face");
+        assert!(session.model.results.iter().all(|result| result.error.is_none()));
+    };
+    let mut edited = Session::default();
+    run(&mut edited, "doc.open", json!({"path":input}));
+    check(&edited);
+    let initial_volume = volume(&mut edited);
+    run(&mut edited, "solid.fillet", json!({"bodies":["Red"],"edges":[[0,10,20]],"radius":2}));
+    check(&edited);
+    run(&mut edited, "solid.move", json!({"bodies":["Red"],"translate":[0,0,5]}));
+    check(&edited);
+    run(&mut edited, "solid.box", json!({"corner":[85,5,15],"length":10,"width":10,"height":10,"body_name":"Cutter"}));
+    run(&mut edited, "solid.combine", json!({"target":"Blue","tools":["Cutter"],"operation":"cut"}));
+    check(&edited);
+    run(&mut edited, "solid.box", json!({"corner":[65,0,0],"length":10,"width":20,"height":20,"body_name":"Joiner"}));
+    run(&mut edited, "solid.combine", json!({"target":"Green","tools":["Joiner"],"operation":"join"}));
+    check(&edited);
+    let edited_volume = volume(&mut edited);
+    // The join adds 5*20*20, the pocket removes 10*10*5, and the
+    // radius-2 quarter-round replaces a 2*2 square along a 20 mm edge.
+    let expected_volume = initial_volume + 2000. - 500. - (4. - PI) * 20.;
+    assert!((edited_volume - expected_volume).abs() < 0.1, "{edited_volume} vs {expected_volume}");
+    run(&mut edited, "edit.undo", json!({}));
+    run(&mut edited, "edit.redo", json!({}));
+    check(&edited);
+    run(&mut edited, "file.save_as", json!({"path":saved}));
+    let mut reopened = Session::default();
+    run(&mut reopened, "doc.open", json!({"path":saved}));
+    check(&reopened);
+    assert!(rel(volume(&mut reopened), edited_volume) < 1e-8);
+    run(&mut reopened, "file.export", json!({"path":output}));
+    let mut roundtrip = Session::default();
+    run(&mut roundtrip, "doc.open", json!({"path":output}));
+    check(&roundtrip);
+    assert!(rel(volume(&mut roundtrip), edited_volume) < 1e-3);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Extrude To Object (a parallel face, with an offset; a slanted face) and From Object.
+#[test]
+fn extrude_to_and_from_objects() {
+    let mut s = Session::default();
+    // A 10 mm plate at z 30…40 to extrude up to, and a profile on XY.
+    run(&mut s, "solid.box", json!({"corner": [0, 0, 30], "length": 40, "width": 40, "height": 10, "body_name": "Roof"}));
+    run(&mut s, "sketch.create", json!({"plane": "XY", "name": "P"}));
+    run(&mut s, "sketch.rectangle.two_point", json!({"p0": [5, 5], "p1": [15, 15]}));
+    run(&mut s, "sketch.finish", json!({}));
+    let top = |s: &mut Session, b: &str| run(s, "inspect.measure", json!({"bodies": [b]}))["bodies"][0]["bbox"]["max"][2].as_f64().unwrap_or(0.0);
+    run(&mut s, "solid.extrude", json!({"sketch": "P", "to": [20, 20, 30], "body_name": "Post"}));
+    assert!((top(&mut s, "Post") - 30.0).abs() < 1e-6, "{}", top(&mut s, "Post"));
+    run(&mut s, "edit.undo", json!({}));
+    run(&mut s, "solid.extrude", json!({"sketch": "P", "to": [20, 20, 30], "to_offset": -5, "body_name": "Post"}));
+    assert!((top(&mut s, "Post") - 25.0).abs() < 1e-6);
+    run(&mut s, "edit.undo", json!({}));
+    // From the roof's top face (z 40) to 10 mm above it.
+    run(&mut s, "solid.extrude", json!({"sketch": "P", "from": [20, 20, 40], "distance": 10, "body_name": "Post"}));
+    let m = run(&mut s, "inspect.measure", json!({"bodies": ["Post"]}));
+    assert!((m["bodies"][0]["bbox"]["min"][2].as_f64().unwrap_or(0.0) - 40.0).abs() < 1e-6 && (top(&mut s, "Post") - 50.0).abs() < 1e-6, "{m}");
+    // The To face is kept by its persistent name, so it is followed when it moves.
+    run(&mut s, "edit.undo", json!({}));
+    run(&mut s, "solid.extrude", json!({"sketch": "P", "to": [20, 20, 30], "body_name": "Post"}));
+    let name = s.doc.features.last().map(|f| f.face_names.clone()).unwrap_or_default();
+    assert_eq!(name, vec!["F1:-z".to_string()], "the To face is stored by name");
+    assert!(s.execute("solid.extrude", &json!({"sketch": "P", "to": "nope"})).is_err());
+}
+
+/// A wedge 40 long and 20 deep whose top slopes from z 30 at x 0 to z 10 at x 40: z = 30 - x / 2.
+fn slanted_wedge(s: &mut Session) {
+    run(s, "sketch.create", json!({"plane": "XZ", "name": "Side"}));
+    run(s, "sketch.line", json!({"closed": true, "points": [[0, 0], [40, 0], [40, -10], [0, -30]]}));
+    run(s, "sketch.finish", json!({}));
+    run(s, "solid.extrude", json!({"sketch": "Side", "distance": 20, "direction": "negative", "body_name": "Wedge"}));
+}
+
+/// The least and greatest z of `body`'s bounding box, and its volume.
+fn z_span_and_volume(s: &mut Session, body: &str) -> (f64, f64, f64) {
+    let m = run(s, "inspect.measure", json!({"bodies": [body]}));
+    let b = &m["bodies"][0];
+    let f = |v: &Value| v.as_f64().unwrap_or(f64::NAN);
+    (f(&b["bbox"]["min"][2]), f(&b["bbox"]["max"][2]), f(&b["volume_mm3"]))
+}
+
+/// From Object on a slanted flat face starts on the face, so a disc of radius 4 at x 20,
+/// extruded 5 mm From the slope, runs from z 22 - 4 / 2 = 18 at x 24 up to 22 + 5 = 27 at x 16.
+/// A design saved before keeps its flat start at the slope's level under the disc's centre,
+/// z 20 to 25 (#17639). It keeps that start through an edit that keeps its From face, and an
+/// edit that picks another face on the same plane, even with no name to match, and an edit that
+/// picks a face on another plane, the top of a ramp z = 15 + x / 2 over the wedge, starts on that
+/// face: z 25 - 2 = 23 at x 16 up to 25 + 2 + 6 = 33 at x 24 for a 6 mm post.
+#[test]
+fn extrude_from_a_slanted_face_starts_on_the_face() {
+    let mut s = Session::default();
+    slanted_wedge(&mut s);
+    run(&mut s, "sketch.create", json!({"plane": "XZ", "name": "RampSide"}));
+    run(&mut s, "sketch.line", json!({"closed": true, "points": [[0, 0], [40, 0], [40, -35], [0, -15]]}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "solid.extrude", json!({"sketch": "RampSide", "distance": 20, "direction": "negative", "operation": "new", "body_name": "Ramp"}));
+    run(&mut s, "sketch.create", json!({"plane": "XY", "name": "Disc"}));
+    run(&mut s, "sketch.circle.center", json!({"center": [20, -10], "radius": 4}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "solid.extrude", json!({"sketch": "Disc", "from": [20, -10, 20], "distance": 5, "operation": "new", "body_name": "Post"}));
+    let disc = PI * 16.0 * 5.0;
+    let (lo, hi, v) = z_span_and_volume(&mut s, "Post");
+    assert!((lo - 18.0).abs() < 1e-6 && (hi - 27.0).abs() < 1e-6 && rel(v, disc) < 1e-6, "{lo} {hi} {v}");
+    // Only the side and the two slanted ends: no piece of the prism's flat caps is left.
+    let faces = run(&mut s, "model.faces", json!({"body": "Post"}));
+    assert_eq!(faces["faces"].as_array().map(Vec::len), Some(3), "{faces}");
+
+    let mut legacy: Value = serde_json::from_str(&s.doc.to_json()).unwrap();
+    legacy["format"] = json!("solidcraft/57");
+    legacy.as_object_mut().unwrap().remove("format_pending");
+    // Without the From face's name, as after a paste or in a design named in an older form, the
+    // edits below still find the face by where it is.
+    let names =
+        legacy["features"].as_array_mut().and_then(|f| f.last_mut()).and_then(Value::as_object_mut).and_then(|post| post.remove("face_names"));
+    assert!(names.is_some(), "the post had stored face names");
+    let dir = std::env::temp_dir().join(format!("solidcraft-17639-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let design = dir.join("post.solidcraft");
+    std::fs::write(&design, legacy.to_string()).unwrap();
+    let mut old = Session::default();
+    run(&mut old, "doc.open", json!({"path": design.to_string_lossy()}));
+    let (lo, hi, v) = z_span_and_volume(&mut old, "Post");
+    assert!((lo - 20.0).abs() < 1e-6 && (hi - 25.0).abs() < 1e-6 && rel(v, disc) < 1e-6, "{lo} {hi} {v}");
+    let post = s.doc.features.last().map(|f| f.name.to_string()).unwrap_or_default();
+    let six = PI * 16.0 * 6.0;
+    run(&mut old, "timeline.edit", json!({"feature": post, "set": {"extent": {"distance": "6"}}}));
+    let (lo, hi, v) = z_span_and_volume(&mut old, "Post");
+    assert!((lo - 20.0).abs() < 1e-6 && (hi - 26.0).abs() < 1e-6 && rel(v, six) < 1e-6, "{lo} {hi} {v}");
+    run(&mut old, "timeline.edit", json!({"feature": post, "set": {"extent": {"from": [22, -12, 19]}}}));
+    let (lo, hi, v) = z_span_and_volume(&mut old, "Post");
+    assert!((lo - 20.0).abs() < 1e-6 && (hi - 26.0).abs() < 1e-6 && rel(v, six) < 1e-6, "{lo} {hi} {v}");
+    run(&mut old, "timeline.edit", json!({"feature": post, "set": {"extent": {"from": [20, -10, 25]}}}));
+    let (lo, hi, v) = z_span_and_volume(&mut old, "Post");
+    assert!((lo - 23.0).abs() < 1e-6 && (hi - 33.0).abs() < 1e-6 && rel(v, six) < 1e-6, "{lo} {hi} {v}");
+    // The same through a redefine, which builds the extrude again from the command's inputs.
+    run(&mut old, "edit.undo", json!({}));
+    let redefine = |s: &mut Session, from: [f64; 3]| {
+        let params = json!({"sketch": "Disc", "from": from, "distance": 6, "operation": "new"});
+        run(s, "timeline.redefine", json!({"feature": post, "command": "solid.extrude", "params": params}));
+        z_span_and_volume(s, "Post")
+    };
+    let (lo, hi, v) = redefine(&mut old, [18.0, -8.0, 21.0]);
+    assert!((lo - 20.0).abs() < 1e-6 && (hi - 26.0).abs() < 1e-6 && rel(v, six) < 1e-6, "{lo} {hi} {v}");
+    let (lo, hi, v) = redefine(&mut old, [20.0, -10.0, 25.0]);
+    assert!((lo - 23.0).abs() < 1e-6 && (hi - 33.0).abs() < 1e-6 && rel(v, six) < 1e-6, "{lo} {hi} {v}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// To Object on a slanted flat face ends a profile that overhangs the face on the face's plane,
+/// as on a face square to the extrusion. An 8 mm deep block from z 40 down to the slope over
+/// x 30 to 45, past the wedge's end at x 40, holds 8 (10 * 15 + (45^2 - 30^2) / 4) = 3450 mm3
+/// (#17639).
+#[test]
+fn extrude_to_a_slanted_face_ends_an_overhanging_profile_on_its_plane() {
+    let mut s = Session::default();
+    slanted_wedge(&mut s);
+    run(&mut s, "sketch.create", json!({"plane": "XY", "offset": 40, "name": "Above"}));
+    run(&mut s, "sketch.rectangle.two_point", json!({"p0": [30, -14], "p1": [45, -6]}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(
+        &mut s,
+        "solid.extrude",
+        json!({"sketch": "Above", "to": [35, -10, 12.5], "direction": "negative", "operation": "new", "body_name": "Block"}),
+    );
+    let (lo, hi, v) = z_span_and_volume(&mut s, "Block");
+    assert!((lo - 7.5).abs() < 1e-6 && (hi - 40.0).abs() < 1e-6 && rel(v, 3450.0) < 1e-9, "{lo} {hi} {v}");
+}
+
+/// A boss joined From the slope of `slanted_wedge` keeps the history of every face it joins:
+/// each face of the result is exact, as after an extrude from the sketch plane, and a sketch on
+/// the boss's slanted top end follows it when the boss gets longer. The boss lies wholly above
+/// the slope, so it adds its own pi 16 5; the nub on its top adds pi 1 2, and lengthening the
+/// boss to 8 mm adds pi 16 3 more (#17639).
+#[test]
+fn a_boss_joined_from_a_slanted_face_keeps_its_faces_history() {
+    let mut s = Session::default();
+    slanted_wedge(&mut s);
+    run(&mut s, "sketch.create", json!({"plane": "XY", "name": "Disc"}));
+    run(&mut s, "sketch.circle.center", json!({"center": [20, -10], "radius": 4}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "solid.extrude", json!({"sketch": "Disc", "from": [20, -10, 20], "distance": 5, "operation": "join", "name": "Boss"}));
+    let wedge = 40.0 * 20.0 * 20.0;
+    assert!(rel(volume(&mut s), wedge + PI * 80.0) < 1e-9, "{}", volume(&mut s));
+    let faces = run(&mut s, "model.faces", json!({"body": "Wedge"}));
+    let inexact: Vec<&Value> = faces["faces"].as_array().into_iter().flatten().filter(|f| f["exact"] != json!(true)).collect();
+    assert!(inexact.is_empty(), "faces without history: {inexact:?}");
+    run(&mut s, "sketch.create", json!({"plane": {"face": [20, -10, 25]}, "name": "OnTop"}));
+    run(&mut s, "sketch.circle.center", json!({"center": [0, 0], "radius": 1}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "solid.extrude", json!({"sketch": "OnTop", "distance": 2, "operation": "join", "name": "Nub"}));
+    assert!(rel(volume(&mut s), wedge + PI * 82.0) < 1e-9, "{}", volume(&mut s));
+    run(&mut s, "timeline.edit", json!({"feature": "Boss", "set": {"extent": {"distance": "8"}}}));
+    assert!(s.model.results.iter().all(|r| r.error.is_none()), "{:?}", s.model.results);
+    assert!(rel(volume(&mut s), wedge + PI * 130.0) < 1e-9, "{}", volume(&mut s));
+}
+
+/// From the slope with the sketch's normal pointing down, away from the slope's (the other
+/// side of each cut): a disc on a flipped sketch at z 50, extruded 5 mm From the slope, runs
+/// down from the slope, z 22 - 4 / 2 - 5 = 13 up to 18 + 4 = 22. A cut 3 mm deep From the slope
+/// into the wedge takes pi 16 3 (#17639).
+#[test]
+fn extrude_from_a_slanted_face_against_its_normal_and_as_a_cut() {
+    let mut s = Session::default();
+    slanted_wedge(&mut s);
+    run(&mut s, "sketch.create", json!({"plane": "XY", "offset": 50, "flip": true, "name": "Down"}));
+    run(&mut s, "sketch.circle.center", json!({"center": [20, -10], "radius": 4}));
+    run(&mut s, "sketch.finish", json!({}));
+    let down = run(&mut s, "solid.extrude", json!({"sketch": "Down", "from": [20, -10, 20], "distance": 5, "operation": "new", "body_name": "Post"}));
+    let (lo, hi, v) = z_span_and_volume(&mut s, "Post");
+    assert!((lo - 13.0).abs() < 1e-6 && (hi - 22.0).abs() < 1e-6 && rel(v, PI * 80.0) < 1e-6, "{lo} {hi} {v} {down}");
+    run(&mut s, "edit.undo", json!({}));
+    run(&mut s, "sketch.create", json!({"plane": "XY", "name": "Disc"}));
+    run(&mut s, "sketch.circle.center", json!({"center": [20, -10], "radius": 4}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "solid.extrude", json!({"sketch": "Disc", "from": [20, -10, 20], "distance": 3, "direction": "negative", "operation": "cut"}));
+    assert!(rel(volume(&mut s), 16000.0 - PI * 48.0) < 1e-9, "{}", volume(&mut s));
+}
+
+/// From a face within 5 degrees of running along the extrusion the extrude still starts at the
+/// face's level under the disc's middle, and says so: the wedge's end leans 1 mm over its 30 mm
+/// height, about 1.9 degrees, and the 5 mm post From it at z 15 runs z 15 to 20 (#17639).
+#[test]
+fn extrude_from_a_face_nearly_along_the_extrusion_starts_at_its_level_and_says_so() {
+    let mut s = Session::default();
+    run(&mut s, "sketch.create", json!({"plane": "XZ", "name": "Side"}));
+    run(&mut s, "sketch.line", json!({"closed": true, "points": [[0, 0], [40, 0], [39, -30], [0, -30]]}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "solid.extrude", json!({"sketch": "Side", "distance": 20, "direction": "negative", "body_name": "Wedge"}));
+    run(&mut s, "sketch.create", json!({"plane": "XY", "name": "Disc"}));
+    run(&mut s, "sketch.circle.center", json!({"center": [40, -10], "radius": 4}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "solid.extrude", json!({"sketch": "Disc", "from": [39.5, -10, 15], "distance": 5, "operation": "new", "body_name": "Post"}));
+    let (lo, hi, v) = z_span_and_volume(&mut s, "Post");
+    assert!((lo - 15.0).abs() < 1e-6 && (hi - 20.0).abs() < 1e-6 && rel(v, PI * 80.0) < 1e-6, "{lo} {hi} {v}");
+    let warning = s.model.results.last().and_then(|r| r.warning.clone()).unwrap_or_default();
+    assert!(warning.contains("within 5 degrees"), "{warning:?}");
+}
+
+/// To the slope with a profile far past the wedge's end, and over other material: the block
+/// over x 30 to 70 ends on the slope's plane all the way, z = 30 - x / 2 down to -5, holding
+/// 8 (10 * 40 + (70^2 - 30^2) / 4) = 11200 mm3. With a step 35 mm tall over x 40 to 50, the
+/// block over x 30 to 55 ends on the step's top where it lies over it, as a profile that stays
+/// over the part does, and on the slope's plane past it: 8 (275 + 50 + 181.25) = 4050 mm3
+/// (#17639).
+#[test]
+fn extrude_to_a_slanted_face_reaches_its_plane_and_stops_at_material_first() {
+    let block = |side: Value, p1: [f64; 2]| {
+        let mut s = Session::default();
+        run(&mut s, "sketch.create", json!({"plane": "XZ", "name": "Side"}));
+        run(&mut s, "sketch.line", json!({"closed": true, "points": side}));
+        run(&mut s, "sketch.finish", json!({}));
+        run(&mut s, "solid.extrude", json!({"sketch": "Side", "distance": 20, "direction": "negative", "body_name": "Wedge"}));
+        run(&mut s, "sketch.create", json!({"plane": "XY", "offset": 40, "name": "Above"}));
+        run(&mut s, "sketch.rectangle.two_point", json!({"p0": [30, -14], "p1": p1}));
+        run(&mut s, "sketch.finish", json!({}));
+        run(
+            &mut s,
+            "solid.extrude",
+            json!({"sketch": "Above", "to": [20, -10, 20], "direction": "negative", "operation": "new", "body_name": "Block"}),
+        );
+        z_span_and_volume(&mut s, "Block")
+    };
+    let (lo, hi, v) = block(json!([[0, 0], [40, 0], [40, -10], [0, -30]]), [70.0, -6.0]);
+    assert!((lo + 5.0).abs() < 1e-6 && (hi - 40.0).abs() < 1e-6 && rel(v, 11200.0) < 1e-9, "{lo} {hi} {v}");
+    let (lo, hi, v) = block(json!([[0, 0], [50, 0], [50, -35], [40, -35], [40, -10], [0, -30]]), [55.0, -6.0]);
+    assert!((lo - 2.5).abs() < 1e-6 && (hi - 40.0).abs() < 1e-6 && rel(v, 4050.0) < 1e-9, "{lo} {hi} {v}");
+}
+
+/// A 20 mm block, z 0 to 10, with a slot 2 mm wide cut through it whose walls slant across X:
+/// x = 4 (y + 11) / 7 and 2 mm further along x, from the block's side at y -10 to y -4, where
+/// the slot ends. Its volume is 4000 - 6 * 2 * 10 = 3880 mm3. Ends in an open sketch on the
+/// plane x 3, whose x and y run along world Y and Z.
+fn slanted_slot_block(s: &mut Session) {
+    run(s, "solid.box", json!({"corner": [-10, -10, 0], "length": 20, "width": 20, "height": 10, "body_name": "Block", "name": "Block"}));
+    run(s, "sketch.create", json!({"plane": "XY", "name": "SlotSketch"}));
+    run(s, "sketch.line", json!({"closed": true, "points": [[0, -11], [2, -11], [6, -4], [4, -4]]}));
+    run(s, "sketch.finish", json!({}));
+    run(s, "solid.extrude", json!({"sketch": "SlotSketch", "distance": 20, "operation": "cut", "name": "Slot"}));
+    run(s, "sketch.create", json!({"plane": "YZ", "offset": 3, "name": "Across"}));
+}
+
+/// From one slanted wall of a slot To the other runs between the two walls' planes (#18825).
+/// The walls lie 2 mm apart along the extrusion everywhere, so the prism over a square 2 mm
+/// across, y -5 to -3 and z 4 to 6, holds 8 mm3: a new body over x 4 (6 / 7) to 2 + 4 (8 / 7).
+/// As a cut it removes only the half past the slot's end, y -4 to -3, 4 mm3. The same square
+/// moved to y -7 to -5 lies wholly in the slot, so its cut removes nothing and says so. From the
+/// slanted wall To the block's flat side at x 10, the square at y -3 to -1 starts on the wall's
+/// plane, x 4 (8 / 7) at y -3, and holds 2 (2 * 10 - 4 * 18 / 7) = 136 / 7 mm3.
+#[test]
+fn extrude_from_a_slanted_face_to_another_runs_between_their_planes() {
+    let square = |s: &mut Session, y: f64| {
+        run(s, "sketch.rectangle.two_point", json!({"p0": [y, 4], "p1": [y + 2.0, 6]}));
+        run(s, "sketch.finish", json!({}));
+    };
+    let walls = json!({"sketch": "Across", "from": [20.0 / 7.0, -6, 5], "to": [2.0 + 20.0 / 7.0, -6, 5]});
+    let with = |base: &Value, extra: Value| {
+        let mut p = base.clone();
+        for (k, v) in extra.as_object().into_iter().flatten() {
+            p[k] = v.clone();
+        }
+        p
+    };
+    let x_span_and_volume = |s: &mut Session, body: &str| {
+        let m = run(s, "inspect.measure", json!({"bodies": [body]}));
+        let b = &m["bodies"][0];
+        let f = |v: &Value| v.as_f64().unwrap_or(f64::NAN);
+        (f(&b["bbox"]["min"][0]), f(&b["bbox"]["max"][0]), f(&b["volume_mm3"]))
+    };
+    let warning = |s: &Session| s.model.results.last().and_then(|r| r.warning.clone()).unwrap_or_default();
+
+    let mut s = Session::default();
+    slanted_slot_block(&mut s);
+    assert!(rel(volume(&mut s), 3880.0) < 1e-9, "{}", volume(&mut s));
+    square(&mut s, -5.0);
+    run(&mut s, "solid.extrude", with(&walls, json!({"operation": "new", "body_name": "Fill"})));
+    let (lo, hi, v) = x_span_and_volume(&mut s, "Fill");
+    assert!((lo - 24.0 / 7.0).abs() < 1e-6 && (hi - (2.0 + 32.0 / 7.0)).abs() < 1e-6 && rel(v, 8.0) < 1e-9, "{lo} {hi} {v}");
+    assert!(!warning(&s).contains("From Object starts on a plane"), "{:?}", warning(&s));
+    run(&mut s, "edit.undo", json!({}));
+    run(&mut s, "solid.extrude", with(&walls, json!({"operation": "cut", "name": "Notch"})));
+    assert!(rel(volume(&mut s), 3876.0) < 1e-9, "{} {:?}", volume(&mut s), warning(&s));
+    assert!(!warning(&s).contains("removes no material"), "{:?}", warning(&s));
+
+    let mut s = Session::default();
+    slanted_slot_block(&mut s);
+    square(&mut s, -7.0);
+    run(&mut s, "solid.extrude", with(&walls, json!({"operation": "cut", "name": "InTheSlot"})));
+    assert!(rel(volume(&mut s), 3880.0) < 1e-9, "{}", volume(&mut s));
+    assert!(warning(&s).contains("the cut removes no material"), "{:?}", warning(&s));
+
+    let mut s = Session::default();
+    slanted_slot_block(&mut s);
+    square(&mut s, -3.0);
+    run(&mut s, "solid.extrude", json!({"sketch": "Across", "from": [20.0 / 7.0, -6, 5], "to": [10, 5, 5], "operation": "new", "body_name": "Fill"}));
+    let (lo, hi, v) = x_span_and_volume(&mut s, "Fill");
+    assert!((lo - 32.0 / 7.0).abs() < 1e-6 && (hi - 10.0).abs() < 1e-6 && rel(v, 136.0 / 7.0) < 1e-9, "{lo} {hi} {v}");
+}
+
+/// What an extrude From a slanted wall of `slanted_slot_block` with To Object does not run
+/// between the two planes for (#18825). With a second side it starts at the From pick's level,
+/// x 20 / 7, as before, and says why: the square at y -3 to -1 runs from x 20 / 7 - 3 to the
+/// block's side at x 10, 4 (10 + 1 / 7) = 284 / 7 mm3. To the plane x 4.6, which crosses the
+/// wall's plane over the square at y -5 to -1, it is refused rather than dropping part of the
+/// profile. An extrude marked to start at the From face's level (`from_level`, as a design saved
+/// with From and To is) starts on the wall once an edit takes To off, as a new one does: x 4 (8 /
+/// 7) to 4 (10 / 7) + 3. A pin hole 1 mm across in a 1 m cube is a cut, and says nothing.
+#[test]
+fn extrude_from_a_slanted_face_with_to_and_a_second_side_crossing_planes_or_to_taken_off() {
+    let warning = |s: &Session| s.model.results.last().and_then(|r| r.warning.clone()).unwrap_or_default();
+    let x_span_and_volume = |s: &mut Session, body: &str| {
+        let m = run(s, "inspect.measure", json!({"bodies": [body]}));
+        let b = &m["bodies"][0];
+        let f = |v: &Value| v.as_f64().unwrap_or(f64::NAN);
+        (f(&b["bbox"]["min"][0]), f(&b["bbox"]["max"][0]), f(&b["volume_mm3"]))
+    };
+    let wall = json!([20.0 / 7.0, -6, 5]);
+    let square = |s: &mut Session, y0: f64, y1: f64| {
+        run(s, "sketch.rectangle.two_point", json!({"p0": [y0, 4], "p1": [y1, 6]}));
+        run(s, "sketch.finish", json!({}));
+    };
+
+    let mut s = Session::default();
+    slanted_slot_block(&mut s);
+    square(&mut s, -3.0, -1.0);
+    run(
+        &mut s,
+        "solid.extrude",
+        json!({"sketch": "Across", "from": wall, "to": [10, 5, 5], "distance2": 3, "operation": "new", "body_name": "Fill"}),
+    );
+    let (lo, hi, v) = x_span_and_volume(&mut s, "Fill");
+    assert!((lo - (20.0 / 7.0 - 3.0)).abs() < 1e-6 && (hi - 10.0).abs() < 1e-6 && rel(v, 284.0 / 7.0) < 1e-9, "{lo} {hi} {v}");
+    assert!(warning(&s).contains("second side"), "{:?}", warning(&s));
+
+    let mut s = Session::default();
+    slanted_slot_block(&mut s);
+    square(&mut s, -5.0, -1.0);
+    let crossed =
+        s.execute("solid.extrude", &json!({"sketch": "Across", "from": wall, "to": [4.6, 30, 30], "operation": "new", "body_name": "Fill"}));
+    assert!(crossed.as_ref().is_err_and(|e| e.to_string().contains("cross over the profile")), "{crossed:?}");
+
+    let mut s = Session::default();
+    slanted_slot_block(&mut s);
+    square(&mut s, -3.0, -1.0);
+    run(&mut s, "solid.extrude", json!({"sketch": "Across", "from": wall, "to": [10, 5, 5], "operation": "new", "body_name": "Fill", "name": "FT"}));
+    run(&mut s, "timeline.edit", json!({"feature": "FT", "set": {"extent": {"from_level": true}}}));
+    let (lo, _, _) = x_span_and_volume(&mut s, "Fill");
+    assert!((lo - 20.0 / 7.0).abs() < 1e-6, "{lo}");
+    // Kept on the level start, it still says why.
+    assert!(warning(&s).contains("because the design was saved before the start followed the slanted face"), "{:?}", warning(&s));
+    run(&mut s, "timeline.edit", json!({"feature": "FT", "set": {"extent": {"to": null, "distance": "3"}}}));
+    let (lo, hi, v) = x_span_and_volume(&mut s, "Fill");
+    assert!((lo - 32.0 / 7.0).abs() < 1e-6 && (hi - (40.0 / 7.0 + 3.0)).abs() < 1e-6 && rel(v, 12.0) < 1e-9, "{lo} {hi} {v}");
+
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"corner": [0, 0, 0], "length": 1000, "width": 1000, "height": 1000, "name": "Big"}));
+    run(&mut s, "sketch.create", json!({"plane": "XY", "offset": 1000, "name": "Pin"}));
+    run(&mut s, "sketch.circle.center", json!({"center": [500, 500], "radius": 0.5}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "solid.extrude", json!({"sketch": "Pin", "distance": -1, "operation": "cut", "name": "PinHole"}));
+    assert!(rel(volume(&mut s), 1e9 - PI * 0.25) < 1e-12, "{}", volume(&mut s));
+    assert!(!warning(&s).contains("removes no material"), "{:?}", warning(&s));
+}
+
+/// The "removes no material" warning on cuts that remove very little from a large body, and From
+/// and To planes that cross over a curved profile by a hair (#18825). A groove 0.2 mm across
+/// turned round Z at radius 5 into the top of a 1 m cube removes 2 pi 5 pi 0.01 / 2 = 0.49 mm3.
+/// A cut that takes away a wall 0.005 mm thick between two pockets removes 0.005 * 10 * 10 = 0.5
+/// mm3, and every face it leaves lies on a plane the pockets had already. Neither warns. A circle
+/// of radius 1 at y -4 on the plane x 3, From the slot's slanted wall To the plane x 3.4303,
+/// which the wall's plane crosses 0.003 mm above the circle's lowest point, is refused.
+#[test]
+fn a_cut_that_removes_very_little_says_nothing_and_planes_crossing_a_curved_profile_are_refused() {
+    let warning = |s: &Session| s.model.results.last().and_then(|r| r.warning.clone()).unwrap_or_default();
+    let big = |s: &mut Session| {
+        run(s, "solid.box", json!({"corner": [-500, -500, 0], "length": 1000, "width": 1000, "height": 1000, "body_name": "Big", "name": "Big"}));
+    };
+
+    let mut s = Session::default();
+    big(&mut s);
+    run(&mut s, "sketch.create", json!({"plane": "XZ", "name": "Ring"}));
+    run(&mut s, "sketch.circle.center", json!({"center": [5, -1000], "radius": 0.1}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "solid.revolve", json!({"sketch": "Ring", "axis": "Z", "operation": "cut", "name": "Groove"}));
+    let removed = 1e9 - volume(&mut s);
+    assert!((removed - PI * PI * 0.05).abs() < 1e-3, "{removed}");
+    assert!(!warning(&s).contains("removes no material"), "{:?}", warning(&s));
+
+    let mut s = Session::default();
+    big(&mut s);
+    run(&mut s, "solid.box", json!({"corner": [-500, -500, 990], "length": 10, "width": 10, "height": 10, "operation": "cut", "name": "PocketA"}));
+    run(
+        &mut s,
+        "solid.box",
+        json!({"corner": [-489.995, -500, 990], "length": 10, "width": 10, "height": 10, "operation": "cut", "name": "PocketB"}),
+    );
+    let pockets = volume(&mut s);
+    run(&mut s, "sketch.create", json!({"plane": "XY", "offset": 1000, "name": "Wall"}));
+    run(&mut s, "sketch.rectangle.two_point", json!({"p0": [-491, -500], "p1": [-489, -490]}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "solid.extrude", json!({"sketch": "Wall", "distance": -10, "operation": "cut", "name": "WallGone"}));
+    let removed = pockets - volume(&mut s);
+    assert!((removed - 0.5).abs() < 1e-3, "{removed}");
+    assert!(!warning(&s).contains("removes no material"), "{:?}", warning(&s));
+
+    let mut s = Session::default();
+    slanted_slot_block(&mut s);
+    run(&mut s, "sketch.circle.center", json!({"center": [-4, 5], "radius": 1}));
+    run(&mut s, "sketch.finish", json!({}));
+    let p = json!({"sketch": "Across", "from": [20.0 / 7.0, -6, 5], "to": [3.430285714285714, 30, 30], "operation": "new", "body_name": "Fill"});
+    let crossed = s.execute("solid.extrude", &p);
+    assert!(crossed.as_ref().is_err_and(|e| e.to_string().contains("cross over the profile")), "{crossed:?}");
+}
+
+/// The extrude window's start rule (`from_slope_height`, which places its arrow) and the build
+/// agree on whether an extrude From the slanted wall of `slanted_slot_block` starts on it, for
+/// seven To picks (none, a point, a face square to the extrusion, the other slanted wall, a
+/// cylinder's side, the tangent edge between a block's side and a fillet, the fillet) with and
+/// without Through All, a taper and a second side (#18825). With To and Through All both set,
+/// To decides the end and the warning doesn't blame Through All.
+#[test]
+fn the_arrow_and_the_build_agree_where_an_extrude_from_a_slanted_face_starts() {
+    let wall = [20.0 / 7.0, -6.0, 5.0];
+    let tos: Vec<(&str, Option<[f64; 3]>)> = vec![
+        ("none", None),
+        ("point", Some([30.0, 30.0, 30.0])),
+        ("square face", Some([10.0, 5.0, 5.0])),
+        ("other wall", Some([2.0 + 20.0 / 7.0, -6.0, 5.0])),
+        ("cylinder side", Some([11.0, -2.0, 5.0])),
+        ("fillet tangent edge", Some([16.0, 10.0, 7.0])),
+        ("fillet face", Some([16.0, 10.0 - 3.0 + 3.0 * std::f64::consts::FRAC_1_SQRT_2, 7.0 + 3.0 * std::f64::consts::FRAC_1_SQRT_2])),
+    ];
+    let mut report = Vec::new();
+    for (to_name, to) in &tos {
+        for through_all in [false, true] {
+            for taper in [false, true] {
+                for two_sided in [false, true] {
+                    let mut s = Session::default();
+                    slanted_slot_block(&mut s);
+                    run(&mut s, "sketch.rectangle.two_point", json!({"p0": [-3, 4], "p1": [-1, 6]}));
+                    run(&mut s, "sketch.finish", json!({}));
+                    run(&mut s, "solid.cylinder", json!({"radius": 3, "height": 12, "base": [14, -2, -1], "body_name": "Cyl"}));
+                    run(&mut s, "solid.box", json!({"corner": [12, 0, 0], "length": 8, "width": 10, "height": 10, "body_name": "Edge"}));
+                    run(&mut s, "solid.fillet", json!({"edges": [[16, 10, 10]], "radius": 3}));
+                    let mut p = json!({"sketch": "Across", "from": wall, "distance": 4, "operation": "new", "body_name": "Fill", "name": "FT"});
+                    if let Some(t) = to {
+                        p["to"] = json!(t);
+                    }
+                    if through_all {
+                        p["through_all"] = json!(true);
+                    }
+                    if taper {
+                        p["taper"] = json!("5 deg");
+                    }
+                    if two_sided {
+                        p["distance2"] = json!(3);
+                    }
+                    let built = s.execute("solid.extrude", &p);
+                    // A taper with two sides is refused, and so is the other wall with a level
+                    // start, which lies in the empty slot; every other row builds.
+                    let refused = (taper && two_sided) || (*to_name == "other wall" && (two_sided || taper || through_all));
+                    assert_eq!(built.is_ok(), !refused, "to {to_name} all {through_all} taper {taper} two {two_sided}: {built:?}");
+                    let warn = s.model.results.last().and_then(|r| r.warning.clone()).unwrap_or_default();
+                    let level_build = warn.contains("From Object starts on a plane parallel");
+                    let st = s.world_state().unwrap();
+                    let centre = solidcore_record::Vec3::new(3.0, -2.0, 5.0);
+                    let plane = solidcore_record::Plane::from_normal(centre, solidcore_record::Vec3::new(1.0, 0.0, 0.0)).unwrap();
+                    let ends = solidcraft_doc::ExtrudeEnds { to: None, through_all, tapered: taper, two_sided };
+                    let arrow = solidcraft_doc::from_slope_height(
+                        &st,
+                        &plane,
+                        centre,
+                        solidcore_record::Vec3::new(wall[0], wall[1], wall[2]),
+                        to.map(|t| solidcore_record::Vec3::new(t[0], t[1], t[2])),
+                        ends,
+                    );
+                    let line = format!(
+                        "to={to_name:20} all={through_all:5} taper={taper:5} two={two_sided:5} | build ok={:5} level={level_build:5} | arrow level={:5} {}",
+                        built.is_ok(),
+                        arrow.is_none(),
+                        if built.is_ok() && level_build != arrow.is_none() { "MISMATCH" } else { "" }
+                    );
+                    if to.is_some() && through_all {
+                        assert!(!warn.contains("because Through All is set"), "{line}: {warn}");
+                    }
+                    report.push(line);
+                }
+            }
+        }
+    }
+    let mismatched: Vec<&String> = report.iter().filter(|l| l.ends_with("MISMATCH")).collect();
+    assert!(mismatched.is_empty(), "{}", report.join("\n"));
+}
+
+/// Revolve Two Sides, Symmetric and To Object.
+#[test]
+fn revolve_two_sides_symmetric_and_to_object() {
+    let ring = |extra: Value| {
+        let mut s = Session::default();
+        run(&mut s, "sketch.create", json!({"plane": "XZ", "name": "S"}));
+        run(&mut s, "sketch.line", json!({"points": [[10, 0], [15, 0], [15, 5], [10, 5]], "closed": true}));
+        run(&mut s, "sketch.finish", json!({}));
+        let mut p = json!({"sketch": "S", "axis": "y", "angle": "90 deg"});
+        for (k, v) in extra.as_object().into_iter().flatten() {
+            p[k] = v.clone();
+        }
+        run(&mut s, "solid.revolve", p);
+        let m = run(&mut s, "inspect.measure", json!({}));
+        (m["total"]["volume_mm3"].as_f64().unwrap_or(0.0), m["bodies"][0]["bbox"].clone())
+    };
+    let full = PI * (225.0 - 100.0) * 5.0;
+    let (v, _) = ring(json!({}));
+    assert!(rel(v, full / 4.0) < 1e-3);
+    let (v, _) = ring(json!({"angle2": "45 deg"}));
+    assert!(rel(v, full * 135.0 / 360.0) < 1e-3, "{v}");
+    let (v, b) = ring(json!({"direction": "symmetric"}));
+    assert!(rel(v, full / 4.0) < 1e-3);
+    // Split evenly: the extent either side of the sketch plane (y = 0) is the same.
+    assert!((b["max"][1].as_f64().unwrap_or(0.0) + b["min"][1].as_f64().unwrap_or(0.0)).abs() < 1e-3, "{b}");
+    // To a point a quarter turn round: the same as 90°.
+    let (v90, b90) = ring(json!({}));
+    let corner = if b90["max"][1].as_f64().unwrap_or(0.0) > 1.0 { json!([0, 12, 0]) } else { json!([0, -12, 0]) };
+    let (v, _) = ring(json!({"to": corner}));
+    assert!(rel(v, v90) < 1e-3, "{v} {v90}");
+}
+
+/// Shell Inside, Outside and Both, and a tangent chain of open faces.
+#[test]
+fn shell_directions_and_tangent_chain() {
+    let shell = |extra: Value| {
+        let mut s = Session::default();
+        run(&mut s, "solid.box", json!({"length": 40, "width": 30, "height": 20}));
+        let mut p = json!({"faces": [[20, 15, 20]], "thickness": 2});
+        for (k, v) in extra.as_object().into_iter().flatten() {
+            p[k] = v.clone();
+        }
+        run(&mut s, "solid.shell", p);
+        let m = run(&mut s, "inspect.measure", json!({}));
+        (m["total"]["volume_mm3"].as_f64().unwrap_or(0.0), m["bodies"][0]["bbox"].clone())
+    };
+    let (v, _) = shell(json!({}));
+    assert!(rel(v, 40.0 * 30.0 * 20.0 - 36.0 * 26.0 * 18.0) < 1e-6, "{v}");
+    // Outside: the walls grow out; the original box is the cavity.
+    let (v, b) = shell(json!({"direction": "outside"}));
+    assert!(rel(v, 44.0 * 34.0 * 22.0 - 40.0 * 30.0 * 20.0) < 1e-6, "{v} {b}");
+    // Both: 1 mm out, 1 mm in.
+    let (v, _) = shell(json!({"direction": "both"}));
+    assert!(rel(v, 42.0 * 32.0 * 21.0 - 38.0 * 28.0 * 19.0) < 1e-6, "{v}");
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 40, "width": 30, "height": 20}));
+    assert!(s.execute("solid.shell", &json!({"faces": [[20, 15, 20]], "thickness": 2, "direction": "sideways"})).is_err());
+}
+
+/// #209: selecting a tangent chain must explain why no shell can remain.
+#[test]
+fn shell_tangent_chain_that_opens_every_face_explains_how_to_keep_walls() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 40, "width": 30, "height": 60}));
+    run(
+        &mut s,
+        "solid.fillet",
+        json!({
+            "edges": [[0,0,30], [40,0,30], [40,30,30], [0,30,30],
+                      [20,0,60], [20,30,60], [0,15,60], [40,15,60],
+                      [20,0,0], [20,30,0], [0,15,0], [40,15,0]],
+            "radius": 1.5
+        }),
+    );
+    let before = s.doc.to_json();
+    for direction in ["inside", "outside", "both"] {
+        let error = s
+            .execute(
+                "solid.shell",
+                &json!({
+                    "faces": [[20,0,30]], "thickness": 2, "tangent_chain": true, "direction": direction
+                }),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("Tangent Chain") && error.contains("every face") && error.contains("turn off"), "{direction}: {error}");
+        assert_eq!(s.doc.to_json(), before, "a refused shell must preserve the design");
+    }
+    run(&mut s, "solid.shell", json!({"faces": [[20,0,30]], "thickness": 2, "tangent_chain": false}));
+    // The rounded box (its 37 x 27 x 57 core grown by the 1.5 ball) less the cavity, which the
+    // 2 mm walls leave sharp, open through the front: 36 x 56 x 28. To the measure's 2e-7.
+    let (a, b, c, r) = (37.0, 27.0, 57.0, 1.5);
+    let rounded = a * b * c + 2.0 * r * (a * b + b * c + a * c) + PI * r * r * (a + b + c) + 4.0 / 3.0 * PI * r * r * r;
+    let want = rounded - 36.0 * 56.0 * 28.0;
+    assert!((volume(&mut s) - want).abs() < 2e-7 * rounded, "{} vs {want}", volume(&mut s));
+    assert_eq!(s.model.state().bodies.len(), 1);
+}
+
+#[test]
+fn shell_explicitly_opening_every_face_explains_how_to_keep_walls() {
+    for (command, params, faces) in [
+        ("solid.sphere", json!({"radius": 10}), json!([[10, 0, 0]])),
+        (
+            "solid.box",
+            json!({"length": 20, "width": 20, "height": 20}),
+            json!([[0, 10, 10], [20, 10, 10], [10, 0, 10], [10, 20, 10], [10, 10, 0], [10, 10, 20]]),
+        ),
+    ] {
+        let mut s = Session::default();
+        run(&mut s, command, params);
+        let before = s.doc.to_json();
+        for tangent_chain in [true, false] {
+            for direction in ["inside", "outside", "both"] {
+                let error = s
+                    .execute("solid.shell", &json!({"faces": faces, "thickness": 1, "tangent_chain": tangent_chain, "direction": direction}))
+                    .unwrap_err()
+                    .to_string();
+                assert!(error.contains("Removing every face leaves no walls") && error.contains("closed hollow body"), "{error}");
+                assert!(!error.contains("turn off Tangent Chain"), "{error}");
+                assert_eq!(s.doc.to_json(), before, "a refused shell must preserve the design");
+            }
+        }
+        run(&mut s, "solid.shell", json!({"faces": [], "thickness": 1}));
+        assert_eq!(s.model.state().bodies.len(), 1, "the suggested closed shell must succeed");
+    }
+}
+
+#[test]
+fn shell_repeated_picks_on_one_face_leave_walls() {
+    for tangent_chain in [true, false] {
+        let mut s = Session::default();
+        run(&mut s, "solid.box", json!({"length": 20, "width": 20, "height": 20}));
+        run(&mut s, "solid.shell", json!({"faces": vec![[10, 10, 20]; 6], "thickness": 1, "tangent_chain": tangent_chain}));
+        assert_eq!(s.model.state().bodies.len(), 1);
+    }
+}
+
+#[test]
+fn shell_invalid_pick_keeps_the_selection_error() {
+    let mut s = Session::default();
+    run(&mut s, "solid.sphere", json!({"radius": 10}));
+    let before = s.doc.to_json();
+    let error =
+        s.execute("solid.shell", &json!({"faces": [[10, 0, 0], [100, 0, 0]], "thickness": 1, "tangent_chain": false})).unwrap_err().to_string();
+    assert!(error.contains("no face"), "{error}");
+    assert_eq!(s.doc.to_json(), before);
+}
+
+/// Hole To Object (a face it meets, or a point) and holes at every point of a sketch.
+#[test]
+fn hole_to_object_and_at_sketch_points() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 40, "width": 30, "height": 20}));
+    // A pocket from below: its ceiling is at z = 10.
+    run(&mut s, "sketch.create", json!({"plane": "XY", "name": "Pocket"}));
+    run(&mut s, "sketch.rectangle.two_point", json!({"p0": [10, 10], "p1": [30, 20]}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "solid.extrude", json!({"sketch": "Pocket", "distance": 10, "operation": "cut"}));
+    let v0 = volume(&mut s);
+    run(&mut s, "solid.hole", json!({"position": [20, 15, 20], "diameter": 4, "to": [25, 15, 10]}));
+    assert!(rel(v0 - volume(&mut s), PI * 4.0 * 10.0) < 1e-3, "{}", v0 - volume(&mut s));
+    run(&mut s, "edit.undo", json!({}));
+    run(&mut s, "solid.hole", json!({"position": [5, 5, 20], "diameter": 4, "to": [5, 5, 12]}));
+    assert!(rel(v0 - volume(&mut s), PI * 4.0 * 8.0) < 1e-3, "{}", v0 - volume(&mut s));
+    // Every point of a sketch: three points (the rectangle's corners are not hole points).
+    let mut t = Session::default();
+    run(&mut t, "solid.box", json!({"length": 40, "width": 30, "height": 10}));
+    run(&mut t, "sketch.create", json!({"plane": {"face": [20, 15, 10]}, "name": "Spots"}));
+    for x in [10, 20, 30] {
+        run(&mut t, "sketch.point", json!({"point": [x, 15]}));
+    }
+    run(&mut t, "sketch.rectangle.two_point", json!({"p0": [2, 2], "p1": [6, 6]}));
+    run(&mut t, "sketch.finish", json!({}));
+    let w0 = volume(&mut t);
+    let r = run(&mut t, "solid.hole", json!({"sketch": "Spots", "diameter": 3}));
+    assert!(rel(w0 - volume(&mut t), 3.0 * PI * 2.25 * 10.0) < 1e-3, "{r} {}", w0 - volume(&mut t));
+}
+
+/// #8087: deleting one sketch point of a Hole drilled at several points drops only that point's
+/// hole, and the Hole's warning names it; the feature keeps the point's id, so undo brings the hole
+/// back. With every point gone the Hole fails, naming them.
+#[test]
+fn a_deleted_sketch_point_drops_only_its_own_hole() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"corner": [0, 0, 0], "length": 60, "width": 20, "height": 10}));
+    run(&mut s, "sketch.create", json!({"plane": {"origin": [0, 0, 10], "x_dir": [1, 0, 0], "y_dir": [0, 1, 0]}, "name": "Pts"}));
+    run(&mut s, "sketch.point", json!({"point": [15, 10], "id": "a"}));
+    run(&mut s, "sketch.point", json!({"point": [45, 10], "id": "b"}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "solid.hole", json!({"sketch": "Pts", "points": ["a", "b"], "diameter": 8, "name": "Holes"}));
+    let bore = PI * 16.0 * 10.0;
+    assert!(rel(volume(&mut s), 12000.0 - 2.0 * bore) < 1e-4, "{}", volume(&mut s));
+    let delete = |s: &mut Session, points: Value| {
+        run(s, "sketch.edit", json!({"sketch": "Pts"}));
+        run(s, "sketch.delete", json!({ "entities": points }));
+        run(s, "sketch.finish", json!({}));
+    };
+    let holes = |s: &Session| s.model.results.iter().find(|r| r.name == "Holes").cloned().unwrap();
+
+    delete(&mut s, json!(["b"]));
+    assert!(rel(volume(&mut s), 12000.0 - bore) < 1e-4, "one Ø8 hole is left: {}", volume(&mut s));
+    let h = holes(&s);
+    assert_eq!(h.error, None);
+    assert_eq!(h.warning.as_deref(), Some("sketch point(s) `b` no longer in the sketch: not drilled there (edit the Hole to drop them)"));
+    assert!(
+        s.model.state().bodies.iter().all(|b| b
+            .body
+            .classify_point(solidcore_record::Vec3::new(15.0, 10.0, 5.0))
+            .expect("classify the point at `a`")
+            == solidcraft_kernel::PointClass::Outside),
+        "the hole at `a` is drilled"
+    );
+    assert!(
+        s.model.state().bodies.iter().any(|b| b
+            .body
+            .classify_point(solidcore_record::Vec3::new(45.0, 10.0, 5.0))
+            .expect("classify the point at `b`")
+            == solidcraft_kernel::PointClass::Inside),
+        "`b`'s spot is solid"
+    );
+    let f = s.doc.find_feature("Holes").unwrap();
+    assert!(matches!(&f.kind, solidcraft_doc::FeatureKind::Hole { points: Some(sp), .. } if sp.ids == ["a", "b"]), "{:?}", f.kind);
+
+    // Undo puts `b` back, and its hole with it.
+    run(&mut s, "edit.undo", json!({}));
+    assert!(rel(volume(&mut s), 12000.0 - 2.0 * bore) < 1e-4, "{}", volume(&mut s));
+    assert_eq!(holes(&s).warning, None);
+
+    delete(&mut s, json!(["a", "b"]));
+    let h = holes(&s);
+    assert_eq!(h.error.as_deref(), Some("unknown sketch point(s) `a`, `b` (none of the hole's points is left in its sketch)"));
+    assert!(rel(volume(&mut s), 12000.0) < 1e-9, "{}", volume(&mut s));
+}
+
+/// Combine keeps its tools on request and can put its result in a new component.
+#[test]
+fn combine_keep_tools_and_new_component() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 20, "width": 20, "height": 20, "body_name": "A"}));
+    run(&mut s, "solid.box", json!({"corner": [10, 0, 0], "length": 20, "width": 20, "height": 20, "body_name": "B"}));
+    let r = run(&mut s, "solid.combine", json!({"target": "A", "tools": ["B"], "operation": "cut", "keep_tools": true, "new_component": true}));
+    let comp = r["component"].as_u64().unwrap_or(0);
+    assert!(comp > 0, "{r}");
+    let st = s.model.state();
+    assert!(st.body("B").is_some(), "the tool is kept");
+    let a = st.body("A").unwrap();
+    assert_eq!(s.doc.body_component("A", a.feature), comp);
+    assert!(rel(solidcraft_kernel::measure(&a.body).unwrap().volume, 4000.0) < 1e-9);
+}
+
+/// Align with snap points: a box's vertex onto another's face centre, an edge midpoint onto a
+/// hole's circle centre.
+#[test]
+fn align_with_snap_points() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 40, "width": 40, "height": 10, "body_name": "Base"}));
+    run(&mut s, "solid.box", json!({"corner": [100, 0, 0], "length": 10, "width": 10, "height": 10, "body_name": "Cube"}));
+    // Cube's corner (100, 0, 0) onto Base's top face centre (20, 20, 10).
+    run(
+        &mut s,
+        "solid.align",
+        json!({"bodies": ["Cube"], "from": {"snap": "vertex", "at": [100.4, 0.3, 0.2]}, "to": {"snap": "face_center", "at": [5, 5, 10]}}),
+    );
+    let m = run(&mut s, "inspect.measure", json!({"bodies": ["Cube"]}));
+    let min = |i: usize| m["bodies"][0]["bbox"]["min"][i].as_f64().unwrap_or(f64::NAN);
+    assert!((min(0) - 20.0).abs() < 1e-6 && (min(1) - 20.0).abs() < 1e-6 && (min(2) - 10.0).abs() < 1e-6, "{m}");
+    assert!(s.execute("solid.align", &json!({"bodies": ["Cube"], "from": {"snap": "nope", "at": [0, 0, 0]}, "to": [0, 0, 0]})).is_err());
+}
+
+/// Boundary Fill: the lens two overlapping boxes share, and one box less the other.
+#[test]
+fn boundary_fill_cells() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 20, "width": 20, "height": 20, "body_name": "A"}));
+    run(&mut s, "solid.box", json!({"corner": [10, 0, 0], "length": 20, "width": 20, "height": 20, "body_name": "B"}));
+    let r = run(&mut s, "solid.boundary_fill", json!({"tools": ["A", "B"], "cells": [[15, 10, 10]], "remove_tools": true}));
+    let m = run(&mut s, "inspect.measure", json!({}));
+    assert_eq!(m["body_count"], 1, "{r} {m}");
+    assert!(rel(m["total"]["volume_mm3"].as_f64().unwrap_or(0.0), 10.0 * 20.0 * 20.0) < 1e-9);
+    run(&mut s, "edit.undo", json!({}));
+    run(&mut s, "solid.boundary_fill", json!({"tools": ["A", "B"], "cells": [[5, 10, 10], [25, 10, 10]], "remove_tools": true}));
+    let m = run(&mut s, "inspect.measure", json!({}));
+    assert!(rel(m["total"]["volume_mm3"].as_f64().unwrap_or(0.0), 2.0 * 10.0 * 20.0 * 20.0) < 1e-9, "{m}");
+    assert!(s.execute("solid.boundary_fill", &json!({"tools": ["A"], "cells": [[100, 100, 100]]})).is_err());
+}
+
+/// An open square tube crossing two cylinders cannot be treated as a solid operand.
+#[test]
+fn boundary_fill_refuses_open_tube_tools_without_changing_the_design() {
+    let mut s = Session::default();
+    run(&mut s, "sketch.create", json!({"plane": {"origin": [100, 0, 0], "x_dir": [0, 1, 0], "y_dir": [0, 0, 1]}, "name": "Section"}));
+    run(&mut s, "sketch.rectangle.two_point", json!({"p0": [-10, 0], "p1": [10, 20]}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "surface.extrude", json!({"sketch": "Section", "distance": 180, "body_name": "Tube"}));
+    run(&mut s, "solid.cylinder", json!({"radius": 105, "height": 100, "base": [0, 0, -40], "body_name": "Inner"}));
+    run(&mut s, "solid.cylinder", json!({"radius": 270, "height": 100, "base": [0, 0, -40], "body_name": "Outer"}));
+    assert!(s.model.state().body("Tube").unwrap().body.is_surface());
+    for remove_tools in [false, true] {
+        let before = s.doc.to_json();
+        let error = s
+            .execute("solid.boundary_fill", &json!({"tools": ["Tube", "Inner", "Outer"], "cells": [[175, 0, 10]], "remove_tools": remove_tools}))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("Boundary Fill needs closed solid tools"), "{error}");
+        assert_eq!(s.doc.to_json(), before);
+        assert_eq!(s.model.state().bodies.len(), 3);
+    }
+}
+
+/// Rectangles name their sides and corners, so they can be dimensioned without inspecting the
+/// sketch first, whichever way round the corners were given.
+#[test]
+fn rectangle_names_sides_and_corners() {
+    let mut s = Session::default();
+    run(&mut s, "sketch.create", json!({"plane": "XY"}));
+    let r = run(&mut s, "sketch.rectangle.two_point", json!({"p0": [40, 30], "p1": [0, 0]}));
+    let pos = |s: &Session, id: &Value| {
+        let sk = s.doc.sketch(s.active_sketch.unwrap()).unwrap();
+        sk.point(sk.resolve_point(id.as_str().unwrap()).unwrap()).unwrap()
+    };
+    for (corner, at) in [("bottom_left", [0.0, 0.0]), ("bottom_right", [40.0, 0.0]), ("top_right", [40.0, 30.0]), ("top_left", [0.0, 30.0])] {
+        let p = pos(&s, &r["corners"][corner]);
+        assert!((p.x - at[0]).abs() < 1e-9 && (p.y - at[1]).abs() < 1e-9, "{corner}: {p:?} in {r}");
+    }
+    for (side, from, to) in [
+        ("bottom", "bottom_left", "bottom_right"),
+        ("right", "bottom_right", "top_right"),
+        ("top", "top_right", "top_left"),
+        ("left", "top_left", "bottom_left"),
+    ] {
+        let line = r["sides"][side].as_str().unwrap();
+        assert!(r["curves"].as_array().unwrap().iter().any(|c| c == line), "{r}");
+        assert_eq!(pos(&s, &json!(format!("{line}.start"))), pos(&s, &r["corners"][from]), "{side} in {r}");
+        assert_eq!(pos(&s, &json!(format!("{line}.end"))), pos(&s, &r["corners"][to]), "{side} in {r}");
+    }
+    run(&mut s, "sketch.constraint.coincident", json!({"a": r["corners"]["bottom_left"], "b": "origin"}));
+    run(&mut s, "sketch.dimension", json!({"entities": [r["sides"]["bottom"]], "value": 50}));
+    run(&mut s, "sketch.dimension", json!({"entities": [r["sides"]["left"]], "value": 20}));
+    let si = run(&mut s, "sketch.inspect", json!({}));
+    assert_eq!(si["dof"], 0, "{si}");
+    let p = pos(&s, &r["corners"]["top_right"]);
+    assert!((p.x - 50.0).abs() < 1e-6 && (p.y - 20.0).abs() < 1e-6, "{p:?}");
+
+    let c = run(&mut s, "sketch.rectangle.center", json!({"center": [100, 0], "corner": [90, 5]}));
+    let p = pos(&s, &c["corners"]["bottom_left"]);
+    assert!((p.x - 90.0).abs() < 1e-9 && (p.y + 5.0).abs() < 1e-9, "{c}");
+    assert_eq!(pos(&s, &json!(format!("{}.start", c["sides"]["top"].as_str().unwrap()))), pos(&s, &c["corners"]["top_right"]), "{c}");
+}
+
+/// Points drawn exactly onto an existing point (the origin, a corner) are connected to it;
+/// `connect: false` leaves them free, and tying them again by hand is a no-op, not a conflict.
+#[test]
+fn drawing_on_existing_points_connects_to_them() {
+    let mut s = Session::default();
+    run(&mut s, "sketch.create", json!({"plane": "XY"}));
+    let n = |v: &Value| v["constraints"].as_array().map_or(0, Vec::len);
+    // Horizontal/vertical x4, plus the corner on the origin.
+    let r = run(&mut s, "sketch.rectangle.two_point", json!({"p0": [0, 0], "p1": [40, 30]}));
+    assert_eq!(n(&r), 5, "{r}");
+    run(&mut s, "sketch.dimension", json!({"entities": [r["curves"][0]], "value": 40}));
+    run(&mut s, "sketch.dimension", json!({"entities": [r["curves"][1]], "value": 30}));
+    let si = run(&mut s, "sketch.inspect", json!({}));
+    assert_eq!(si["dof"], 0, "fully constrained without a hand-made coincident: {si}");
+    let again = run(&mut s, "sketch.constraint.coincident", json!({"a": "origin", "b": "l1.start"}));
+    assert_eq!(again["existing"], true, "{again}");
+
+    // A line from a corner, a circle on a corner and a point on the origin connect too.
+    assert_eq!(n(&run(&mut s, "sketch.line", json!({"points": [[40, 30], [60, 30]]}))), 1);
+    assert_eq!(n(&run(&mut s, "sketch.circle.center", json!({"center": [0, 30], "radius": 3}))), 1);
+    assert_eq!(n(&run(&mut s, "sketch.point", json!({"point": [0, 0]}))), 1);
+    // Close is not on it, and `connect: false` opts out.
+    assert_eq!(n(&run(&mut s, "sketch.point", json!({"point": [40.001, 0]}))), 0);
+    assert_eq!(n(&run(&mut s, "sketch.line", json!({"points": [[0, 0], [0, -10]], "connect": false}))), 0);
+    let si = run(&mut s, "sketch.inspect", json!({}));
+    assert_ne!(si["status"], "conflict", "{si}");
+}
+
+#[test]
+fn computed_import_preserves_file_and_earlier_undo_history() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 10, "width": 10, "height": 10}));
+    s.path = Some("existing.solidcraft".into());
+    s.mark_saved();
+    let saved = s.doc.clone();
+    let mut computed = s.scratch();
+    run(&mut computed, "solid.box", json!({"length": 5, "width": 5, "height": 5, "corner": [30, 0, 0]}));
+    s.accept_computed(computed).unwrap();
+    assert_eq!(s.path.as_deref(), Some("existing.solidcraft"));
+    assert!(s.is_dirty());
+    assert_eq!(s.model.state().bodies.len(), 2);
+    run(&mut s, "edit.undo", json!({}));
+    assert!(std::sync::Arc::ptr_eq(&saved, &s.doc));
+    assert!(!s.is_dirty());
+    run(&mut s, "edit.undo", json!({}));
+    assert!(s.model.state().bodies.is_empty());
+}
+
+/// Plugin tracking lives in the session, never in authored bytes or undo snapshots.
+#[test]
+fn design_tokens_stay_outside_authored_documents_and_history() {
+    let mut s = Session::default();
+    let before = s.doc.to_json();
+    let token = s.design_token();
+    let value: Value = serde_json::from_str(&before).unwrap();
+    assert!(value.get("document_id").is_none() && value.get("revision").is_none());
+    run(&mut s, "parameters.add", json!({"name": "width", "expression": "10 mm"}));
+    let edited = s.design_token();
+    let edited_bytes = s.doc.to_json();
+    assert_ne!(edited, token);
+    run(&mut s, "edit.undo", json!({}));
+    let undone = s.design_token();
+    assert_eq!(s.doc.to_json(), before);
+    assert_ne!(undone, token);
+    assert_ne!(undone, edited);
+    run(&mut s, "edit.redo", json!({}));
+    assert_eq!(s.doc.to_json(), edited_bytes);
+    assert_ne!(s.design_token(), undone);
+    assert_ne!(s.design_token(), edited);
+    assert_eq!(s.design_token().document_id, token.document_id);
+    let reopened = Session::opened_at((*s.doc).clone(), None, None);
+    assert_eq!(reopened.doc.to_json(), edited_bytes);
+    assert_ne!(reopened.design_token().document_id, s.design_token().document_id);
+}
+
+/// Plugin result tokens follow committed history for one open session and never
+/// give a branched edit the token of a discarded state. Reopening starts a new identity.
+#[test]
+fn design_tokens_follow_edits_history_save_and_reopen() {
+    let folder = Folder::new("design-revision-token");
+    let path = folder.path("part.sc");
+    let mut s = Session::default();
+    let initial = s.design_token();
+    assert_ne!(initial.document_id, Session::default().design_token().document_id);
+    run(&mut s, "parameters.add", json!({"name": "width", "expression": "10 mm"}));
+    let edited = s.design_token();
+    assert_eq!(initial.document_id, edited.document_id);
+    assert_ne!(initial, edited);
+    run(&mut s, "file.save_as", json!({"path": path}));
+    assert_eq!(s.design_token(), edited, "saving is not an edit");
+    run(&mut s, "edit.undo", json!({}));
+    let undone = s.design_token();
+    assert_ne!(undone, edited);
+    run(&mut s, "edit.redo", json!({}));
+    assert_ne!(s.design_token(), undone);
+    assert_ne!(s.design_token(), edited);
+    run(&mut s, "edit.undo", json!({}));
+    run(&mut s, "parameters.add", json!({"name": "width", "expression": "20 mm"}));
+    assert_ne!(s.design_token(), edited, "a branched edit never reuses the discarded token");
+    let mut reopened = Session::default();
+    run(&mut reopened, "doc.open", json!({"path": path}));
+    assert_ne!(reopened.design_token().document_id, edited.document_id, "reopening starts a new open-design identity");
+    run(&mut reopened, "parameters.change", json!({"name": "width", "expression": "30 mm"}));
+    assert_ne!(reopened.design_token(), edited);
+    assert_ne!(reopened.design_token(), s.design_token(), "independent open copies do not reuse an edit token");
+}
+
+/// Per-part undo can combine a drawing snapshot with a model edited later. Such
+/// a composite must not inherit either previous whole-document state's token.
+#[test]
+fn design_tokens_distinguish_composite_drawing_history() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 1, "width": 1, "height": 1}));
+    run(&mut s, "drawing.create", json!({}));
+    let drawing_created = s.design_token();
+    run(&mut s, "drawing.set", json!({"name": "Detail"}));
+    let drawing_edited = s.design_token();
+    run(&mut s, "parameters.add", json!({"name": "width", "expression": "10 mm"}));
+    let model_edited = s.design_token();
+    run(&mut s, "edit.undo", json!({}));
+    let composite = s.design_token();
+    assert_ne!(composite, drawing_created);
+    assert_ne!(composite, drawing_edited);
+    assert_ne!(composite, model_edited);
+    assert!(s.doc.params.iter().any(|p| p.name == "width"), "drawing undo keeps the model edit");
+    run(&mut s, "edit.redo", json!({}));
+    assert_ne!(s.design_token(), composite);
+}
+
+/// Drawing history creates fresh whole-design tokens even when undo restores
+/// exactly the saved authored content. Those tokens are not unsaved changes.
+#[test]
+fn design_tokens_drawing_undo_restores_saved_content_without_dirtying() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 1, "width": 1, "height": 1}));
+    run(&mut s, "drawing.create", json!({}));
+    s.mark_saved();
+    let saved = s.design_token();
+    assert!(!s.is_dirty());
+    run(&mut s, "drawing.set", json!({"name": "Detail"}));
+    let edited = s.design_token();
+    assert_ne!(edited, saved);
+    assert!(s.is_dirty());
+    run(&mut s, "edit.undo", json!({}));
+    let undone = s.design_token();
+    assert_ne!(undone, saved, "drawing undo retains a fresh whole-design token");
+    assert_ne!(undone, edited);
+    assert_eq!(s.doc.drawings, s.saved.drawings);
+    assert!(!s.is_dirty(), "undo restored the saved content despite its new token");
+    run(&mut s, "edit.redo", json!({}));
+    let redone = s.design_token();
+    assert_ne!(redone, saved);
+    assert_ne!(redone, edited);
+    assert_ne!(redone, undone);
+    assert!(s.is_dirty(), "redo restored the drawing edit");
+}
+
+#[test]
+fn design_tokens_computed_save_preserves_the_saved_token() {
+    let folder = Folder::new("computed-save-token");
+    let mut s = Session::default();
+    let token = s.design_token();
+    let commands = vec![("file.save_as".to_string(), json!({"path": folder.path("part.sc")}))];
+    let computed = s.scratch().compute_commands(&commands, None).unwrap();
+    s.accept_commands(computed).unwrap();
+    assert_eq!(s.design_token(), token);
+    let mut saved = s.scratch();
+    run(&mut saved, "file.save_as", json!({"path": folder.path("renamed.sc")}));
+    s.adopt_save(&saved);
+    let unchanged = s.scratch();
+    s.accept_computed(unchanged).unwrap();
+    assert_eq!(s.design_token(), token, "adopting a save preserves the association too");
+}
+
+#[test]
+fn design_tokens_open_pinning_preserves_token_on_noop_acceptance() {
+    let mut original = Session::default();
+    run(&mut original, "solid.box", json!({"length": 1, "width": 1, "height": 1}));
+    let mut doc = (*original.doc).clone();
+    for feature in &mut doc.features {
+        feature.body_names.clear();
+    }
+    doc.reserved_body_names.clear();
+    let mut opened = Session::opened_at(doc, None, None);
+    let token = opened.design_token();
+    let unchanged = opened.scratch();
+    opened.accept_computed(unchanged).unwrap();
+    assert_eq!(opened.design_token(), token);
+}
+
+#[test]
+fn design_tokens_direct_computed_mutations_after_commands_get_a_fresh_token() {
+    let mut s = Session::default();
+    let mut computed = s.scratch();
+    run(&mut computed, "parameters.add", json!({"name": "width", "expression": "10 mm"}));
+    let executed = computed.design_token();
+    computed.doc_mut().name = "Direct candidate edit".into();
+    s.accept_computed(computed).unwrap();
+    assert_ne!(s.design_token(), executed);
+}
+
+#[test]
+fn design_tokens_accepting_historical_candidates_never_reuses_their_tokens() {
+    let mut s = Session::default();
+    let older = s.scratch();
+    let historical = older.design_token();
+    let bytes = s.doc.to_json();
+    run(&mut s, "parameters.add", json!({"name": "width", "expression": "10 mm"}));
+    let edited = s.design_token();
+    let edited_bytes = s.doc.to_json();
+    let older_edited = s.scratch();
+    run(&mut s, "edit.undo", json!({}));
+    let current = s.design_token();
+    s.accept_computed(older).unwrap();
+    assert_eq!(s.design_token(), current, "an identical historical candidate keeps the live token");
+    assert_eq!(s.doc.to_json(), bytes);
+    s.accept_computed(older_edited).unwrap();
+    assert_eq!(s.doc.to_json(), edited_bytes);
+    assert_ne!(s.design_token(), historical);
+    assert_ne!(s.design_token(), edited);
+    assert_ne!(s.design_token(), current);
+}
+
+#[test]
+fn design_tokens_sketch_cancel_restores_authored_bytes_with_a_fresh_token() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 1, "width": 1, "height": 1}));
+    let bytes = s.doc.to_json();
+    let original = s.design_token();
+    run(&mut s, "sketch.create", json!({"plane": "XY"}));
+    run(&mut s, "sketch.rectangle.two_point", json!({"p0": [0, 0], "p1": [5, 5]}));
+    let edited = s.design_token();
+    run(&mut s, "sketch.cancel", json!({}));
+    assert_eq!(s.doc.to_json(), bytes);
+    assert_ne!(s.design_token(), original);
+    assert_ne!(s.design_token(), edited);
+}
+
+/// Selection, view refresh and a refused edit do not invalidate a computed design result.
+#[test]
+fn design_tokens_ignore_view_changes_and_refused_commands() {
+    let mut s = Session::default();
+    let token = s.design_token();
+    s.invalidate_view(s.revision);
+    run(&mut s, "select.clear", json!({}));
+    assert!(s.execute("parameters.add", &json!({"name": "width", "expression": "invalid +"})).is_err());
+    assert_eq!(s.design_token(), token);
+}
+
+/// The unsaved-changes answer is worked out once per pair of documents and revision, and stays
+/// right through every way the design changes: an edit in place (`doc_mut`, which stays in
+/// place), one that bypasses it, a new document equal to the saved one, Save, a change of what
+/// is hidden, and undo back to the saved design. Each answer is checked against the plain
+/// comparison it stands for.
+#[test]
+fn the_unsaved_changes_answer_follows_every_change() {
+    let plain = |s: &Session| (!std::sync::Arc::ptr_eq(&s.doc, &s.saved) && *s.doc != *s.saved) || s.visibility != s.saved_visibility;
+    let check = |s: &Session, want: bool, why: &str| {
+        for _ in 0..2 {
+            assert_eq!(s.is_dirty(), want, "{why}");
+            assert_eq!(plain(s), want, "{why}: the plain comparison");
+        }
+    };
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 10, "width": 10, "height": 10}));
+    s.mark_saved();
+    check(&s, false, "saved");
+    // An edit in place: the cached answer holds the document, yet the edit is not a copy.
+    s.doc = std::sync::Arc::new((*s.doc).clone());
+    check(&s, false, "an equal copy of the saved design");
+    let at = std::sync::Arc::as_ptr(&s.doc);
+    s.doc_mut().name = "Renamed".into();
+    assert_eq!(std::sync::Arc::as_ptr(&s.doc), at, "doc_mut edits in place");
+    check(&s, true, "renamed in place, same revision");
+    s.doc_mut().name = s.saved.name.clone();
+    check(&s, false, "named back in place");
+    // An edit that goes around doc_mut while the answer holds the document copies it.
+    std::sync::Arc::make_mut(&mut s.doc).name = "Elsewhere".into();
+    check(&s, true, "edited past doc_mut");
+    s.mark_saved();
+    check(&s, false, "saved again");
+    run(&mut s, "solid.box", json!({"length": 5, "width": 5, "height": 5, "corner": [30, 0, 0]}));
+    check(&s, true, "a command");
+    run(&mut s, "edit.undo", json!({}));
+    check(&s, false, "undone back to the saved design");
+    s.visibility.hidden_bodies.push("Body1".into());
+    check(&s, true, "a body hidden");
+    s.visibility.hidden_bodies.clear();
+    check(&s, false, "shown again");
+}
+
+/// The bodies of `state` that keep a kernel form now.
+fn warm_bodies(state: &solidcraft_doc::ModelState) -> Vec<&str> {
+    state.bodies.iter().filter(|b| b.body.holds_kernel_form()).map(|b| b.name.as_str()).collect()
+}
+
+/// Every body of `state` is given its SMLib form, as an operation on it would.
+fn warm(state: &solidcraft_doc::ModelState) {
+    for b in &state.bodies {
+        b.body.smlib().unwrap();
+    }
+}
+
+/// A 5 mm cube `Other`, then `Block`, `w` x 30 x 10 with a 5 x 5 pocket through it
+/// (300 w − 250 mm³): `w` changes Block only.
+fn block_beside_a_cube() -> Session {
+    let mut s = Session::default();
+    build_block_beside_a_cube(&mut s);
+    s
+}
+
+fn build_block_beside_a_cube(s: &mut Session) {
+    run(s, "parameters.add", json!({"name": "w", "expression": "40 mm"}));
+    run(s, "solid.box", json!({"length": 5, "width": 5, "height": 5, "corner": [0, 40, 0], "body_name": "Other"}));
+    run(s, "solid.box", json!({"length": "w", "width": 30, "height": 10, "body_name": "Block"}));
+    run(s, "solid.box", json!({"length": 5, "width": 5, "height": 20, "corner": [2, 2, 0], "operation": "cut", "targets": ["Block"]}));
+}
+
+/// #19629: the evaluation cache keeps the states of the values tried before and counts their
+/// bodies by their records, so those bodies keep no kernel form (several times the record): a
+/// body lets go of it when it leaves the model, and the record gives it again when the value
+/// comes back. A body the edit leaves in the model keeps its form.
+#[test]
+fn bodies_that_leave_the_model_let_go_of_their_kernel_forms() {
+    let mut s = block_beside_a_cube();
+    let first = s.model.state();
+    warm(&first);
+    assert_eq!(warm_bodies(&first), ["Other", "Block"]);
+    run(&mut s, "parameters.change", json!({"name": "w", "expression": "50 mm"}));
+    assert_eq!(warm_bodies(&first), ["Other"], "Block left the model, Other is still in it");
+    let second = s.model.state();
+    warm(&second);
+    let r = run(&mut s, "parameters.change", json!({"name": "w", "expression": "40 mm"}));
+    assert_eq!(r["recomputed"], 0, "the value set back is found in the cache: {r}");
+    assert_eq!(warm_bodies(&second), ["Other"]);
+    let back = s.model.state();
+    assert_eq!(warm_bodies(&back), ["Other"], "Block came back without its form");
+    let block = &back.body("Block").unwrap().body;
+    assert!(rel(block.smlib().unwrap().volume(1e-8).unwrap(), 11_750.0) < 1e-9, "made again from the record");
+    assert!(rel(volume(&mut s), 11_875.0) < 1e-9);
+}
+
+/// #19629: a session at rest lets nothing go: a command that changes no state and warms no body
+/// that had let go ends without a pass, and so does adopting nothing new.
+#[test]
+fn a_command_that_changes_nothing_runs_no_pass_over_the_bodies() {
+    let mut s = block_beside_a_cube();
+    let passes = |s: &Session| s.model.cache.lock().unwrap().release_passes;
+    run(&mut s, "inspect.measure", json!({}));
+    run(&mut s, "inspect.measure", json!({}));
+    let at_rest = passes(&s);
+    run(&mut s, "inspect.measure", json!({}));
+    run(&mut s, "select.clear", json!({}));
+    assert_eq!(passes(&s), at_rest);
+    run(&mut s, "parameters.change", json!({"name": "w", "expression": "50 mm"}));
+    assert!(passes(&s) > at_rest, "an edit is followed by one");
+}
+
+/// #19629: a model put back from an earlier copy of the session (as leaving an editor does) lets
+/// go of the bodies it replaces, although that copy held the same states when it was taken.
+#[test]
+fn a_model_put_back_from_an_earlier_copy_lets_go_of_the_bodies_it_replaces() {
+    let mut s = block_beside_a_cube();
+    warm(&s.model.state());
+    run(&mut s, "inspect.measure", json!({}));
+    let original = s.scratch();
+    run(&mut s, "parameters.change", json!({"name": "w", "expression": "50 mm"}));
+    let changed = s.model.state();
+    warm(&changed);
+    run(&mut s, "inspect.measure", json!({}));
+    assert_eq!(warm_bodies(&changed), ["Other", "Block"]);
+    s.accept_computed(original).unwrap();
+    assert_eq!(warm_bodies(&changed), ["Other"]);
+}
+
+/// #19629: the cache keeps a body in what its feature changed after the state it was in is gone
+/// (here at once: the cache keeps one state). The body lets go of its forms all the same.
+#[test]
+fn a_body_the_cache_keeps_after_its_state_is_gone_lets_go_of_its_forms() {
+    let mut s = Session::default();
+    *s.model.cache.lock().unwrap() = solidcraft_doc::EvalCache::with_budget(1);
+    build_block_beside_a_cube(&mut s);
+    let first = s.model.state();
+    warm(&first);
+    let block = first.body("Block").unwrap().body.clone();
+    let state = std::sync::Arc::downgrade(&first);
+    drop(first);
+    // A full cache drops the result that took the least time to compute per byte, which a clock
+    // decides: the state goes here, before the edit, and the cache keeps the body in `Change`.
+    s.model.cache.lock().unwrap().forget_states();
+    run(&mut s, "parameters.change", json!({"name": "w", "expression": "50 mm"}));
+    assert!(state.upgrade().is_none(), "the state is gone");
+    assert!(!block.holds_kernel_form());
+    assert!(rel(volume(&mut s), 14_875.0) < 1e-9);
+}
+
+/// #19629: a model whose states no evaluation here made (a saved model opened as it was saved)
+/// lets go of the bodies its first edit replaces.
+#[test]
+fn the_first_edit_of_a_model_not_evaluated_here_lets_go_of_the_bodies_it_replaces() {
+    let mut s = block_beside_a_cube();
+    // The cache as a design just opened has it: nothing noted of the model it shows.
+    *s.model.cache.lock().unwrap() = solidcraft_doc::EvalCache::default();
+    let first = s.model.state();
+    warm(&first);
+    run(&mut s, "parameters.change", json!({"name": "w", "expression": "50 mm"}));
+    assert_eq!(warm_bodies(&first), ["Other"]);
+    // The body was noted in the cache before this one, and this cache hears of its form made
+    // again all the same.
+    first.body("Block").unwrap().body.smlib().unwrap();
+    assert_eq!(warm_bodies(&first), ["Other", "Block"]);
+    run(&mut s, "inspect.measure", json!({}));
+    assert_eq!(warm_bodies(&first), ["Other"]);
+}
+
+/// #19629: a copy still using a body after the session let its forms go makes them again; they
+/// are let go again at the end of the session's next command, one that only reads included.
+#[test]
+fn a_body_a_copy_used_after_it_left_the_session_lets_go_again() {
+    let mut s = block_beside_a_cube();
+    let first = s.model.state();
+    warm(&first);
+    let reader = s.scratch();
+    run(&mut s, "parameters.change", json!({"name": "w", "expression": "50 mm"}));
+    assert_eq!(warm_bodies(&first), ["Other"]);
+    reader.model.state().body("Block").unwrap().body.smlib().unwrap();
+    assert_eq!(warm_bodies(&first), ["Other", "Block"], "the reader's use keeps the form again");
+    drop(reader);
+    run(&mut s, "inspect.measure", json!({}));
+    assert_eq!(warm_bodies(&first), ["Other"]);
+}
+
+/// #19629: a copy of the session (a preview, a trial) shares the session's bodies, so it lets
+/// go of none; the bodies only the copy evaluated let go at the end of the session's next
+/// command, one that only reads included.
+#[test]
+fn bodies_only_a_copy_evaluated_let_go_after_the_sessions_next_command() {
+    let mut s = block_beside_a_cube();
+    let first = s.model.state();
+    warm(&first);
+    let mut trial = s.scratch();
+    run(&mut trial, "parameters.change", json!({"name": "w", "expression": "45 mm"}));
+    let tried = trial.model.state();
+    warm(&tried);
+    assert_eq!(warm_bodies(&first), ["Other", "Block"], "the copy lets go of nothing of the session's");
+    drop(trial);
+    assert_eq!(warm_bodies(&tried), ["Other", "Block"], "kept in the cache as the copy left it");
+    run(&mut s, "inspect.measure", json!({}));
+    assert_eq!(warm_bodies(&tried), ["Other"], "the copy's own body, which the session never held");
+    assert_eq!(warm_bodies(&first), ["Other", "Block"], "the session's model is as it was");
+}
+
+/// #19629: an edit computed on a copy and adopted in its place (as a dialog's OK does) lets go
+/// of the bodies it replaced, as an edit evaluated in place does, also when another command ran
+/// here between the computing and the adopting. Block at 50: 14 750 mm³.
+#[test]
+fn an_edit_adopted_from_a_copy_lets_go_of_the_bodies_it_replaced() {
+    let mut s = block_beside_a_cube();
+    let first = s.model.state();
+    warm(&first);
+    let edit = [("parameters.change".to_string(), json!({"name": "w", "expression": "50 mm"}))];
+    let prepared = s.scratch().compute_commands(&edit, None).unwrap();
+    assert_eq!(warm_bodies(&first), ["Other", "Block"], "computing on the copy lets go of nothing");
+    run(&mut s, "inspect.measure", json!({}));
+    assert_eq!(warm_bodies(&first), ["Other", "Block"], "the session still holds them");
+    s.accept_commands(prepared).unwrap();
+    assert_eq!(warm_bodies(&first), ["Other"]);
+    assert!(rel(volume(&mut s), 14_875.0) < 1e-9);
+}
+
+/// #19629: a feature behind the history marker keeps its result, and with it its body's forms;
+/// when that result is dropped (the feature built again for another value), they go.
+#[test]
+fn a_result_kept_behind_the_history_marker_keeps_its_forms_until_it_is_dropped() {
+    let mut s = block_beside_a_cube();
+    let last = s.model.state();
+    warm(&last);
+    run(&mut s, "timeline.roll_to", json!({"position": 2}));
+    assert_eq!(warm_bodies(&last), ["Other", "Block"], "the pocket's result is kept behind the marker");
+    run(&mut s, "parameters.change", json!({"name": "w", "expression": "50 mm"}));
+    run(&mut s, "timeline.roll_to", json!({"position": "end"}));
+    assert_eq!(warm_bodies(&last), ["Other"], "the pocket was built again for the new value");
+    assert!(rel(volume(&mut s), 14_875.0) < 1e-9);
+}
+
+/// Commands evaluated ahead (off the window thread) and then run for real take what was
+/// evaluated: on a design whose states are past the shared cache's budget the second run
+/// evaluated everything again, so an off-thread command cost twice its time.
+#[test]
+fn commands_evaluated_ahead_are_not_evaluated_again() {
+    let mut s = Session::default();
+    run(&mut s, "parameters.add", json!({"name": "w", "expression": "40 mm"}));
+    run(&mut s, "solid.box", json!({"length": "w", "width": 30, "height": 10, "body_name": "Block"}));
+    run(&mut s, "solid.chamfer", json!({"edges": [[10, 0, 10]], "distance": 1}));
+    run(&mut s, "solid.box", json!({"length": 5, "width": 5, "height": 20, "corner": [2, 2, 0], "operation": "cut"}));
+    let commands = vec![("parameters.change".to_string(), json!({"name": "w", "expression": "50 mm"}))];
+    let evaluated = s.ahead().evaluate(&commands).unwrap();
+    // The shared cache dropped those results (as it does past its budget).
+    s.model.cache = Default::default();
+    let mut unprimed = s.scratch();
+    s.prime(&evaluated);
+    let r = run(&mut s, "parameters.change", json!({"name": "w", "expression": "50 mm"}));
+    s.unprime();
+    assert_eq!((&r["recomputed"], &r["restored"]), (&json!(0), &json!(3)), "every feature taken from the evaluation ahead: {r}");
+    let r = run(&mut unprimed, "parameters.change", json!({"name": "w", "expression": "50 mm"}));
+    assert_eq!(r["recomputed"], 3, "without it, all evaluated again: {r}");
+    for (a, b) in s.model.state().bodies.iter().zip(&unprimed.model.state().bodies) {
+        assert_eq!(a.mesh().bounds(), b.mesh().bounds());
+    }
+    // Inputs that differ from those evaluated ahead are evaluated, as usual.
+    s.model.cache = Default::default();
+    s.prime(&evaluated);
+    let r = run(&mut s, "parameters.change", json!({"name": "w", "expression": "60 mm"}));
+    s.unprime();
+    assert_eq!(r["recomputed"], 3, "{r}");
+    assert!((s.model.state().body("Block").unwrap().mesh().bounds().max.x - 60.0).abs() < 1e-9);
+}
+
+#[test]
+fn adopting_a_computed_component_keeps_its_warm_world_geometry() {
+    let mut s = Session::default();
+    run(&mut s, "component.create", json!({"name": "Part"}));
+    run(&mut s, "solid.box", json!({"length":10,"width":10,"height":10}));
+    let mut computed = s.scratch();
+    run(&mut computed, "solid.box", json!({"length":5,"width":5,"height":5,"corner":[30,0,0]}));
+    let prepared = computed.world_state().unwrap();
+    for b in &prepared.bodies {
+        let _ = b.mesh();
+    }
+    s.accept_computed(computed).unwrap();
+    assert!(std::sync::Arc::ptr_eq(&prepared, &s.world_state().unwrap()));
+    s.invalidate_view(100);
+    assert!(std::sync::Arc::ptr_eq(&prepared, &s.world_state().unwrap()));
+}
+
+/// Every file command checked the size with the metadata and then read to the end. A character
+/// device reports a length of 0, so the cap passed and the read never finished; a FIFO blocked
+/// the calling thread, which over the control channel is the thread drawing the window.
+#[cfg(unix)]
+#[test]
+fn special_files_are_refused_by_every_file_command() {
+    let mut s = Session::default();
+    for cmd in ["doc.open", "parameters.import"] {
+        let r = s.execute(cmd, &json!({"path": "/dev/zero"}));
+        assert!(r.as_ref().is_err_and(|e| e.to_string().contains("not a regular file")), "{cmd}: {r:?}");
+    }
+    // The commands that check the extension first need a special file with the right name.
+    let dir = std::env::temp_dir().join(format!("solidcraft-special-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    for (cmd, name) in [("file.insert_step", "x.step"), ("file.insert_mesh", "x.3mf"), ("sketch.insert_dxf", "x.dxf")] {
+        let p = dir.join(name);
+        let _ = std::fs::remove_file(&p);
+        if !std::process::Command::new("mkfifo").arg(&p).status().map(|st| st.success()).unwrap_or(false) {
+            continue;
+        }
+        let r = s.execute(cmd, &json!({"path": p.to_string_lossy()}));
+        assert!(r.as_ref().is_err_and(|e| e.to_string().contains("not a regular file")), "{cmd}: {r:?}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A cut targeted at one body leaves a non-target body alone, even one the tool covers completely (#260).
+#[test]
+fn targeted_cut_keeps_a_covered_body_that_is_not_a_target() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 10, "width": 10, "height": 10, "operation": "new_body", "body_name": "Frame"}));
+    run(&mut s, "solid.box", json!({"length": 10, "width": 10, "height": 10, "corner": [20, 0, 0], "operation": "new_body", "body_name": "Other"}));
+    // Exactly Other's extent; it does not touch Frame.
+    run(&mut s, "solid.box", json!({"length": 10, "width": 10, "height": 10, "corner": [20, 0, 0], "operation": "cut", "targets": ["Frame"]}));
+    let names: Vec<String> = s.model.state().bodies.iter().map(|b| b.name.clone()).collect();
+    assert_eq!(names, ["Frame", "Other"]);
+    assert!(rel(volume(&mut s), 2000.0) < 1e-6);
+}
+
+/// A frame's opening cut over a separate mesh body that sits in it: the mesh survives (#260).
+#[test]
+fn targeted_cut_keeps_an_overlapping_body_that_is_not_a_target() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 50, "width": 50, "height": 5, "operation": "new_body", "body_name": "Frame"}));
+    run(&mut s, "solid.box", json!({"length": 30, "width": 30, "height": 1, "corner": [10, 10, 2], "operation": "new_body", "body_name": "Mesh"}));
+    run(&mut s, "solid.box", json!({"length": 30, "width": 30, "height": 5, "corner": [10, 10, 0], "operation": "cut", "targets": ["Frame"]}));
+    let names: Vec<String> = s.model.state().bodies.iter().map(|b| b.name.clone()).collect();
+    assert_eq!(names, ["Frame", "Mesh"]);
+    assert!(rel(volume(&mut s), 50.0 * 50.0 * 5.0 - 30.0 * 30.0 * 5.0 + 900.0) < 1e-6);
+}
+
+/// A join with explicit `targets` merges into those bodies only; a touched non-target stays (#259).
+#[test]
+fn join_with_targets_leaves_other_touched_bodies_alone() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 10, "width": 10, "height": 10, "operation": "new_body", "body_name": "A"}));
+    run(&mut s, "solid.box", json!({"length": 10, "width": 10, "height": 10, "corner": [10, 0, 0], "operation": "new_body", "body_name": "B"}));
+    // Straddles the face between A and B; only A is a target.
+    run(&mut s, "solid.box", json!({"length": 4, "width": 4, "height": 4, "corner": [8, 3, 3], "operation": "join", "targets": ["A"]}));
+    let names: Vec<String> = s.model.state().bodies.iter().map(|b| b.name.clone()).collect();
+    assert_eq!(names, ["A", "B"], "B is not a target and must stay a body");
+    let b = run(&mut s, "inspect.measure", json!({"bodies": ["B"]}))["total"]["volume_mm3"].as_f64().unwrap();
+    assert!(rel(b, 1000.0) < 1e-6, "B is unchanged: {b}");
+    // A gains the half of the tool outside it.
+    let a = run(&mut s, "inspect.measure", json!({"bodies": ["A"]}))["total"]["volume_mm3"].as_f64().unwrap();
+    assert!(rel(a, 1032.0) < 1e-6, "A: {a}");
+}
+
+/// Deleting a sketch takes its extrude with it; a later combine that names the extrude's body must
+/// not be left failing silently: it is deleted too, or the reply reports it (#267).
+#[test]
+fn deleting_a_sketch_leaves_no_silently_failing_feature() {
+    let mut s = Session::default();
+    run(&mut s, "sketch.create", json!({"plane": "XY", "name": "S"}));
+    run(&mut s, "sketch.rectangle.two_point", json!({"p0": [0, 0], "p1": [20, 20]}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "solid.extrude", json!({"sketch": "S", "distance": "10", "body_name": "P"}));
+    run(&mut s, "solid.box", json!({"length": 5, "width": 5, "height": 5, "corner": [18, 5, 0], "operation": "new_body", "body_name": "Q"}));
+    run(&mut s, "solid.combine", json!({"target": "P", "tools": ["Q"], "name": "JoinPQ"}));
+    let reply = run(&mut s, "timeline.delete", json!({"features": ["S"]}));
+    if let Ok(join) = s.execute("timeline.inspect", &json!({"feature": "JoinPQ"})) {
+        assert!(
+            join["error"].is_null() || reply.to_string().contains("JoinPQ"),
+            "JoinPQ now fails ({}) but the reply only says {reply}",
+            join["error"]
+        );
+    }
+}
+
+#[test]
+fn default_extrude_profiles_preserve_two_holes() {
+    let mut sketch = Session::default();
+    run(&mut sketch, "sketch.create", json!({"plane": "XY"}));
+    run(&mut sketch, "sketch.rectangle.two_point", json!({"p0": [0, 0], "p1": [60, 40]}));
+    for x in [15, 45] {
+        run(&mut sketch, "sketch.circle.center", json!({"center": [x, 20], "radius": 5}));
+    }
+    run(&mut sketch, "sketch.finish", json!({}));
+    for (selection, expected) in [
+        (None, (2400.0 - 50.0 * PI) * 5.0),
+        (Some(json!([0])), (2400.0 - 50.0 * PI) * 5.0),
+        (Some(json!("all")), 12000.0),
+        (Some(json!([0, 1, 2])), 12000.0),
+    ] {
+        let mut s = Session::new((*sketch.doc).clone());
+        let mut params = json!({"distance": 5});
+        if let Some(selection) = selection {
+            params["profiles"] = selection;
+        }
+        run(&mut s, "solid.extrude", params);
+        let actual = volume(&mut s);
+        assert!(rel(actual, expected) < 1e-4, "{actual} vs {expected}");
+    }
+}
+
+#[test]
+fn default_extrude_profiles_keep_even_depth_islands_and_separate_outlines() {
+    let mut s = Session::default();
+    run(&mut s, "sketch.create", json!({"plane": "XY"}));
+    for (p0, p1) in [([0, 0], [30, 30]), ([5, 5], [25, 25]), ([10, 10], [20, 20]), ([40, 0], [50, 10])] {
+        run(&mut s, "sketch.rectangle.two_point", json!({"p0": p0, "p1": p1}));
+    }
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "solid.extrude", json!({"distance": 5}));
+    assert_eq!(s.model.state().bodies.len(), 3);
+    let expected = (900.0 - 400.0 + 100.0 + 100.0) * 5.0;
+    let actual = volume(&mut s);
+    assert!(rel(actual, expected) < 1e-6, "{actual} vs {expected}");
+}
+
+/// The face of `body` whose normal points along +x, as a plane pick.
+fn side_face_pick(s: &Session, body: &str) -> Value {
+    let world = s.world_state().unwrap();
+    let b = world.body(body).unwrap();
+    let face = b
+        .body
+        .faces(0.01)
+        .unwrap()
+        .into_iter()
+        .filter(|f| f.plane_normal.is_some_and(|n| n.dot(solidcore_record::Vec3::X) > 0.999))
+        .max_by(|a, b| a.centroid.x.total_cmp(&b.centroid.x))
+        .unwrap();
+    json!({"body": b.name, "index": face.index, "face": [face.centroid.x, face.centroid.y, face.centroid.z]})
+}
+
+#[test]
+fn extruding_a_sketch_on_a_side_face_takes_the_whole_drawn_profile() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 40, "width": 30, "height": 20, "body_name": "Base"}));
+    let pick = side_face_pick(&s, "Base");
+    let id = run(&mut s, "sketch.create", json!({"plane": pick, "name": "Side"}))["sketch"].as_u64().unwrap();
+    // The rectangle straddles the top edge of the face, so the projected outline cuts it in two.
+    run(&mut s, "sketch.rectangle.two_point", json!({"p0": [10, 15], "p1": [20, 25]}));
+    run(&mut s, "sketch.finish", json!({}));
+    for selection in [json!([1]), json!([2]), json!([{"point": [15, 17]}]), json!([{"point": [15, 22]}])] {
+        let mut s2 = Session::new((*s.doc).clone());
+        run(&mut s2, "solid.extrude", json!({"sketch": id, "distance": 5, "operation": "new", "body_name": "Rib", "profiles": selection.clone()}));
+        let state = s2.model.state();
+        let rib = state.bodies.iter().find(|b| b.name == "Rib").unwrap();
+        let v = rib.body.mesh(&solidcraft_kernel::MeshTolerance::chord(1e-2)).unwrap().measure().volume;
+        assert!(rel(v, 500.0) < 1e-6, "{selection}: {v}");
+    }
+}
+
+/// A pick on a region of a drawn profile that reference geometry bounds from inside (the rim of
+/// a hole in the face) takes only that region: the rim is a real boundary of the material, and
+/// the drawn outline around it is not cut by it (#5302).
+#[test]
+fn a_pick_bounded_by_a_projected_rim_takes_only_that_region() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 40, "width": 30, "height": 20, "body_name": "Base"}));
+    run(&mut s, "solid.hole", json!({"position": [20, 15, 20], "diameter": 10}));
+    let id = run(&mut s, "sketch.create", json!({"plane": {"face": [20, 5, 20]}}))["sketch"].as_u64().unwrap();
+    // The square around the hole: the hole's rim is projected into the sketch and bounds an
+    // inner region of it, but does not cut the square.
+    run(&mut s, "sketch.rectangle.two_point", json!({"p0": [10, 5], "p1": [30, 25]}));
+    run(&mut s, "sketch.finish", json!({}));
+    let mut s2 = Session::new((*s.doc).clone());
+    run(&mut s2, "solid.extrude", json!({"sketch": id, "distance": 5, "operation": "new", "body_name": "Pad", "profiles": [{"point": [12, 7]}]}));
+    let state = s2.model.state();
+    let pad = state.bodies.iter().find(|b| b.name == "Pad").unwrap();
+    let v = pad.body.mesh(&solidcraft_kernel::MeshTolerance::chord(1e-2)).unwrap().measure().volume;
+    // The square with the hole's rim cut out of it, not the whole square. The mesh measures the
+    // round rim as a polygon, so the volume is a little under the analytic one.
+    let want = (400.0 - PI * 25.0) * 5.0;
+    assert!(rel(v, want) < 5e-3, "{v} vs {want}");
+}
+
+/// A circle drawn partly past the edge of the top face its sketch is on: the face's projected
+/// outline cuts it into a lens on the face and a crescent past it. A pick that asks for exactly
+/// its region, as the dialogs do, builds that region alone (#6724); a plain pick still takes the
+/// whole drawn circle (#5302).
+#[test]
+fn an_exact_pick_of_a_region_cut_by_the_face_outline_takes_only_that_region() {
+    let mut s = Session::default();
+    run(&mut s, "sketch.create", json!({"plane": "XY"}));
+    run(&mut s, "sketch.circle.center", json!({"center": [0, 0], "radius": 10}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "solid.extrude", json!({"distance": 10, "body_name": "Base"}));
+    let id = run(&mut s, "sketch.create", json!({"plane": {"face": [0, 0, 10]}}))["sketch"].as_u64().unwrap();
+    run(&mut s, "sketch.circle.center", json!({"center": [10, 0], "radius": 6}));
+    run(&mut s, "sketch.finish", json!({}));
+    // The two circles' lens, and the rest of the drawn circle past the face.
+    let (r1, r2, d) = (10.0_f64, 6.0_f64, 10.0_f64);
+    let lens = r1 * r1 * ((d * d + r1 * r1 - r2 * r2) / (2.0 * d * r1)).acos() + r2 * r2 * ((d * d + r2 * r2 - r1 * r1) / (2.0 * d * r2)).acos()
+        - 0.5 * ((-d + r1 + r2) * (d + r1 - r2) * (d - r1 + r2) * (d + r1 + r2)).sqrt();
+    let disc = PI * r2 * r2;
+    let crescent = disc - lens;
+    let state = s.model.state();
+    let ss = state.sketch(id).unwrap();
+    assert_eq!(ss.profiles.len(), 3, "the lens, the crescent past the face and the rest of the face");
+    let at = |x: f64| ss.profiles.iter().position(|p| p.region.contains(solidcore_record::Vec2::new(x, 0.0))).unwrap();
+    let (on_face, past_face) = (at(7.0), at(14.0));
+    // The volume of the new body, and how many profiles its extrude is built from.
+    let extrude = |extra: Value| -> (f64, usize) {
+        let mut s2 = Session::new((*s.doc).clone());
+        let mut p = json!({"sketch": id, "distance": 5, "operation": "new", "body_name": "Pad"});
+        if let (Some(p), Value::Object(extra)) = (p.as_object_mut(), extra) {
+            p.extend(extra);
+        }
+        run(&mut s2, "solid.extrude", p);
+        let state = s2.model.state();
+        let Some(solidcraft_doc::FeatureKind::Extrude { profiles, .. }) = s2.doc.features.last().map(|f| &f.kind) else { panic!("an extrude") };
+        let count = solidcraft_doc::profile_selection_indices(state.sketch(id).unwrap(), profiles).unwrap().len();
+        let v = state
+            .bodies
+            .iter()
+            .filter(|b| b.name.starts_with("Pad"))
+            .map(|b| b.body.mesh(&solidcraft_kernel::MeshTolerance::chord(1e-2)).unwrap().measure().volume)
+            .sum();
+        (v, count)
+    };
+    for (profiles, want, n) in [
+        (json!([on_face]), lens, 1),
+        (json!([past_face]), crescent, 1),
+        (json!([{"point": [7, 0]}]), lens, 1),
+        (json!([{"point": [14, 0]}]), crescent, 1),
+        (json!([on_face, past_face]), disc, 2),
+    ] {
+        let (v, count) = extrude(json!({"profiles": profiles.clone(), "exact_regions": true}));
+        assert!(rel(v, want * 5.0) < 5e-3, "{profiles}: {v} vs {}", want * 5.0);
+        assert_eq!(count, n, "{profiles}");
+    }
+    // Without `exact_regions`, a pick on either piece takes the whole drawn circle (#5302).
+    for profiles in [json!([on_face]), json!([{"point": [14, 0]}])] {
+        let (v, count) = extrude(json!({"profiles": profiles.clone()}));
+        assert!(rel(v, disc * 5.0) < 5e-3, "{profiles}: {v} vs {}", disc * 5.0);
+        assert_eq!(count, 2, "{profiles}");
+    }
+}
+
+/// An explicit pick of a drawn hole still fills only that hole (#5176).
+#[test]
+fn an_explicit_pick_of_a_drawn_hole_fills_only_that_hole() {
+    let mut s = Session::default();
+    run(&mut s, "sketch.create", json!({"plane": "XY"}));
+    run(&mut s, "sketch.rectangle.two_point", json!({"p0": [0, 0], "p1": [60, 40]}));
+    run(&mut s, "sketch.circle.center", json!({"center": [30, 20], "radius": 5, "id": "ring"}));
+    run(&mut s, "sketch.finish", json!({}));
+    let ring = s.model.state().sketches[0].profiles.iter().position(|p| p.outer_curves == ["ring"]).unwrap();
+    run(&mut s, "solid.extrude", json!({"distance": 5, "profiles": [ring]}));
+    assert!(rel(volume(&mut s), 25.0 * PI * 5.0) < 1e-4, "the hole alone: {}", volume(&mut s));
+}
+
+/// Every body a multi-profile `new` extrude creates carries its `body_name`, not a generic BodyN (#266).
+#[test]
+fn multi_profile_extrude_names_every_body_after_body_name() {
+    let mut s = Session::default();
+    run(&mut s, "sketch.create", json!({"plane": "XY", "name": "R"}));
+    for x in [0, 10, 20] {
+        run(&mut s, "sketch.rectangle.two_point", json!({"p0": [x, 0], "p1": [x + 5, 30]}));
+    }
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "solid.extrude", json!({"distance": "10", "operation": "new_body", "body_name": "Ribs"}));
+    let names: Vec<String> = s.model.state().bodies.iter().map(|b| b.name.clone()).collect();
+    assert!(names.iter().all(|n| n.starts_with("Ribs")), "{names:?}");
+    assert!(rel(volume(&mut s), 4500.0) < 1e-6);
+}
+
+/// Renaming one pattern copy leaves the other copies' names alone (#265).
+#[test]
+fn renaming_a_pattern_copy_keeps_the_other_copies_names() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 10, "width": 10, "height": 10, "operation": "new_body", "body_name": "X"}));
+    run(&mut s, "solid.pattern.rectangular", json!({"bodies": ["X"], "dir1": [1, 0, 0], "count1": 3, "spacing1": 20}));
+    run(&mut s, "body.rename", json!({"body": "X (2)", "name": "Second"}));
+    let third = run(&mut s, "inspect.measure", json!({"bodies": ["X (3)"]}));
+    assert_eq!(third["bodies"][0]["bbox"]["min"][0].as_f64().map(f64::round), Some(40.0), "X (3) is still the copy at x = 40: {third}");
+    run(&mut s, "body.rename", json!({"body": "X (3)", "name": "Third"}));
+    let names: Vec<String> = s.model.state().bodies.iter().map(|b| b.name.clone()).collect();
+    assert_eq!(names, ["X", "Second", "Third"]);
+}
+
+/// Three solids in one STEP file that carry the same label: the file written for three boxes, each
+/// named `X`.
+fn step_three_solids_labelled_x(tag: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("solidcraft-step-{tag}-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut s = Session::default();
+    for (i, label) in ["Aa", "Bb", "Cc"].iter().enumerate() {
+        let corner = [30.0 * i as f64, 0.0, 0.0];
+        run(&mut s, "solid.box", json!({"length": 10, "width": 10, "height": 10, "corner": corner, "operation": "new_body", "body_name": label}));
+    }
+    let p = dir.join("Three.step");
+    run(&mut s, "file.export", json!({"path": p.to_string_lossy()}));
+    let mut text = std::fs::read_to_string(&p).unwrap();
+    for label in ["Aa", "Bb", "Cc"] {
+        assert!(text.contains(&format!("MANIFOLD_SOLID_BREP('{label}'")), "the file names its solids: {label}");
+        text = text.replace(&format!("MANIFOLD_SOLID_BREP('{label}'"), "MANIFOLD_SOLID_BREP('X'");
+    }
+    std::fs::write(&p, text).unwrap();
+    p
+}
+
+/// Renaming one of several imported bodies that share a label leaves the names of the others alone:
+/// the model lists them as `X`, `X (2)`, `X (3)`, and `X (3)` is still there after `X (2)` is renamed.
+#[test]
+fn renaming_an_imported_body_keeps_the_names_of_its_duplicates() {
+    let p = step_three_solids_labelled_x("duplicate-labels");
+    let mut s = Session::default();
+    run(&mut s, "file.insert_step", json!({"path": p.to_string_lossy()}));
+    let names = |s: &Session| s.model.state().bodies.iter().map(|b| b.name.clone()).collect::<Vec<_>>();
+    assert_eq!(names(&s), ["X", "X (2)", "X (3)"]);
+    let x_of =
+        |s: &mut Session, body: &str| run(s, "inspect.measure", json!({"bodies": [body]}))["bodies"][0]["bbox"]["min"][0].as_f64().map(f64::round);
+    assert_eq!(x_of(&mut s, "X (3)"), Some(60.0));
+    run(&mut s, "body.rename", json!({"body": "X (2)", "name": "Second"}));
+    assert_eq!(names(&s), ["X", "Second", "X (3)"]);
+    assert_eq!(x_of(&mut s, "X (3)"), Some(60.0), "X (3) is still the solid at x = 60");
+    run(&mut s, "body.rename", json!({"body": "X (3)", "name": "Third"}));
+    assert_eq!(names(&s), ["X", "Second", "Third"]);
+    assert_eq!(x_of(&mut s, "Third"), Some(60.0));
+    // The names survive a rebuild and a reopen of the saved design.
+    let design = p.with_file_name("Three.solidcraft");
+    run(&mut s, "file.save_as", json!({"path": design.to_string_lossy()}));
+    let mut r = Session::default();
+    run(&mut r, "doc.open", json!({"path": design.to_string_lossy()}));
+    assert_eq!(names(&r), ["X", "Second", "Third"]);
+}
+
+/// The same when the first of the three is renamed: `X (2)` and `X (3)` do not slide down to `X` and
+/// `X (2)`, and what is set on one of them (a material) stays with it.
+#[test]
+fn renaming_the_first_imported_duplicate_keeps_the_numbers_of_the_others() {
+    let p = step_three_solids_labelled_x("duplicate-labels-first");
+    let mut s = Session::default();
+    run(&mut s, "file.insert_step", json!({"path": p.to_string_lossy()}));
+    run(&mut s, "material.assign", json!({"bodies": ["X (3)"], "material": "Steel"}));
+    run(&mut s, "body.rename", json!({"body": "X", "name": "First"}));
+    let names: Vec<String> = s.model.state().bodies.iter().map(|b| b.name.clone()).collect();
+    assert_eq!(names, ["First", "X (2)", "X (3)"]);
+    assert!(s.doc.materials.contains_key("X (3)"), "the material is still on X (3): {:?}", s.doc.materials.keys().collect::<Vec<_>>());
+}
+
+/// Parameters that work are listed in the command's params doc, which is all agents see (#271).
+#[test]
+fn params_docs_list_working_parameters() {
+    let mut s = Session::default();
+    let cmds = run(&mut s, "engine.commands", json!({}));
+    let params =
+        |id: &str| cmds.as_array().unwrap().iter().find(|c| c["id"] == id).and_then(|c| c["params"].as_str()).unwrap_or_default().to_string();
+    // Both work today: a named base flange, and a loft cut limited to its targets.
+    run(&mut s, "sketch.create", json!({"plane": "XY", "name": "A"}));
+    run(&mut s, "sketch.rectangle.two_point", json!({"p0": [0, 0], "p1": [50, 50]}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "sheet.flange", json!({"sketch": "A", "body_name": "Panel A"}));
+    assert!(s.model.state().body("Panel A").is_some());
+    assert!(params("sheet.flange").contains("body_name"), "sheet.flange: {}", params("sheet.flange"));
+    assert!(params("solid.loft").contains("targets"), "solid.loft: {}", params("solid.loft"));
+}
+
+/// Every body-creating feature documents the keys `add_feature` reads for all of them (`name`,
+/// `body_name`), and those that take `targets` say so (#271).
+#[test]
+fn feature_params_docs_list_shared_keys() {
+    let mut s = Session::default();
+    let cmds = run(&mut s, "engine.commands", json!({}));
+    let params =
+        |id: &str| cmds.as_array().unwrap().iter().find(|c| c["id"] == id).and_then(|c| c["params"].as_str()).unwrap_or_default().to_string();
+    let with_targets = ["solid.extrude", "solid.revolve", "solid.sweep", "solid.loft", "solid.pipe", "solid.coil"];
+    let without_targets = ["solid.box", "solid.cylinder", "solid.sphere", "solid.torus", "solid.cone", "sheet.flange"];
+    for id in with_targets.iter().chain(&without_targets) {
+        let doc = params(id);
+        assert!(doc.contains("name?") && doc.contains("body_name?"), "{id}: {doc}");
+    }
+    for id in with_targets {
+        assert!(params(id).contains("targets?"), "{id}: {}", params(id));
+    }
+}
+
+#[test]
+fn a_pattern_repeats_a_fillet_on_the_edges_it_found() {
+    // #219: a filleted pocket patterned along the plate, its height from a parameter. A taller
+    // pocket moves its far corner edges away from the points picked for the fillet; the pattern
+    // repeats the edges the fillet found (by name), not those points.
+    let mut s = Session::default();
+    run(&mut s, "parameters.add", json!({"name": "n", "expression": "14", "unit": ""}));
+    run(&mut s, "parameters.add", json!({"name": "h", "expression": "(419.1 mm - 3.175 mm - (n - 1) * 3.175 mm) / n", "unit": "mm"}));
+    run(&mut s, "sketch.create", json!({"plane": "XY"}));
+    run(&mut s, "sketch.rectangle.two_point", json!({"p0": [0, 0], "p1": [150, 422.275]}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "solid.extrude", json!({"distance": 19.05, "name": "Plate"}));
+    run(&mut s, "construct.plane.offset", json!({"base": "XY", "offset": 19.05, "name": "PocketPlane"}));
+    run(&mut s, "sketch.create", json!({"plane": "PocketPlane"}));
+    run(&mut s, "sketch.rectangle.two_point", json!({"p0": [3.175, 3.175], "p1": [146.825, 29.9357]}));
+    run(&mut s, "sketch.dimension", json!({"entities": ["origin", "p1"], "type": "horizontal", "value": "3.175"}));
+    run(&mut s, "sketch.dimension", json!({"entities": ["origin", "p1"], "type": "vertical", "value": "3.175"}));
+    run(&mut s, "sketch.dimension", json!({"entities": ["l1"], "type": "length", "value": "143.65"}));
+    run(&mut s, "sketch.dimension", json!({"entities": ["l4"], "type": "length", "value": "h"}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "solid.extrude", json!({"distance": 12.7, "direction": "negative", "operation": "cut", "name": "Pocket"}));
+    run(
+        &mut s,
+        "solid.fillet",
+        json!({"edges": [[3.175, 3.175, 12.700000000000001], [146.825, 3.175, 12.700000000000001], [146.825, 29.9357, 12.700000000000001], [3.175, 29.9357, 12.700000000000001]], "radius": 3.2}),
+    );
+    run(
+        &mut s,
+        "solid.pattern.rectangular",
+        json!({"features": ["Pocket", "Fillet1"], "dir1": [0, 1, 0], "count1": "n", "spacing1": "h + 3.175 mm"}),
+    );
+    let r = run(&mut s, "parameters.change", json!({"name": "n", "expression": "10"}));
+    assert_eq!(r["errors"].as_array().map(Vec::len), Some(0), "{r}");
+    let (n, h) = (10.0, (419.1 - 3.175 - 9.0 * 3.175) / 10.0);
+    let pocket = 143.65 * h * 12.7 - 4.0 * (1.0 - PI / 4.0) * 3.2 * 3.2 * 12.7;
+    let expect = 150.0 * 422.275 * 19.05 - n * pocket;
+    assert!(rel(volume(&mut s), expect) < 1e-5, "{} vs {expect}", volume(&mut s));
+}
+
+/// A body renamed after a join: the next new body does not take the name the rename freed
+/// (#4957). The join changed the body, so the rename is followed by a full evaluation of the
+/// design; the numbers the design handed out must not go back with it, or a script that names
+/// a body finds another one.
+#[test]
+fn a_renamed_body_keeps_its_number_from_the_next_body() {
+    for join in [false, true] {
+        let mut s = Session::default();
+        run(&mut s, "sketch.create", json!({"plane": "XY"}));
+        run(&mut s, "sketch.rectangle.two_point", json!({"p0": [0, 0], "p1": [10, 10]}));
+        run(&mut s, "sketch.finish", json!({}));
+        run(&mut s, "solid.extrude", json!({"distance": 5, "operation": "new"}));
+        if join {
+            // A second box joined to the first: the join changes the body, so the rename
+            // cannot be followed without evaluating the design again.
+            run(&mut s, "sketch.create", json!({"plane": "XY"}));
+            run(&mut s, "sketch.rectangle.two_point", json!({"p0": [5, 0], "p1": [15, 10]}));
+            run(&mut s, "sketch.finish", json!({}));
+            run(&mut s, "solid.extrude", json!({"distance": 5, "operation": "join"}));
+        }
+        run(&mut s, "body.rename", json!({"body": "Body1", "name": "First"}));
+        run(&mut s, "sketch.create", json!({"plane": "XY"}));
+        run(&mut s, "sketch.rectangle.two_point", json!({"p0": [20, 0], "p1": [30, 10]}));
+        run(&mut s, "sketch.finish", json!({}));
+        run(&mut s, "solid.extrude", json!({"distance": 5, "operation": "new"}));
+        let names: Vec<String> = s.model.state().bodies.iter().map(|b| b.name.clone()).collect();
+        assert_eq!(names, ["First", "Body2"], "with a join: {join}");
+    }
+}
+
+/// A copy added by raising the count after a rename takes the next number, not the freed one (#372).
+#[test]
+fn raising_a_pattern_count_after_a_rename_numbers_the_new_copy_after_the_others() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 10, "width": 10, "height": 10, "operation": "new_body", "body_name": "X"}));
+    run(&mut s, "solid.pattern.rectangular", json!({"bodies": ["X"], "dir1": [1, 0, 0], "count1": 3, "spacing1": 20, "name": "Pat"}));
+    run(&mut s, "body.rename", json!({"body": "X (2)", "name": "Second"}));
+    run(&mut s, "timeline.edit", json!({"feature": "Pat", "set": {"pattern": {"count1": "4"}}}));
+    let names: Vec<String> = s.model.state().bodies.iter().map(|b| b.name.clone()).collect();
+    assert_eq!(names, ["X", "Second", "X (3)", "X (4)"]);
+    let fourth = run(&mut s, "inspect.measure", json!({"bodies": ["X (4)"]}));
+    assert_eq!(fourth["bodies"][0]["bbox"]["min"][0].as_f64().map(f64::round), Some(60.0), "{fourth}");
+}
+
+/// A profile added to the sketch after a named multi-profile extrude is named after `body_name`
+/// too (#373).
+#[test]
+fn a_profile_added_later_is_named_after_body_name() {
+    let mut s = Session::default();
+    run(&mut s, "sketch.create", json!({"plane": "XY", "name": "R"}));
+    for x in [0, 10, 20] {
+        run(&mut s, "sketch.rectangle.two_point", json!({"p0": [x, 0], "p1": [x + 5, 30]}));
+    }
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "solid.extrude", json!({"sketch": "R", "distance": "10", "operation": "new_body", "body_name": "Ribs"}));
+    run(&mut s, "sketch.edit", json!({"sketch": "R"}));
+    run(&mut s, "sketch.rectangle.two_point", json!({"p0": [30, 0], "p1": [35, 30]}));
+    run(&mut s, "sketch.finish", json!({}));
+    let names: Vec<String> = s.model.state().bodies.iter().map(|b| b.name.clone()).collect();
+    assert_eq!(names, ["Ribs", "Ribs (2)", "Ribs (3)", "Ribs (4)"]);
+}
+
+/// The reply names the bodies the feature created, apart from the ones already there (#374).
+#[test]
+fn extrude_reply_lists_the_bodies_it_created() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 5, "width": 5, "height": 5, "corner": [0, 50, 0], "operation": "new_body", "body_name": "Base"}));
+    run(&mut s, "sketch.create", json!({"plane": "XY", "name": "R"}));
+    for x in [0, 10, 20] {
+        run(&mut s, "sketch.rectangle.two_point", json!({"p0": [x, 0], "p1": [x + 5, 30]}));
+    }
+    run(&mut s, "sketch.finish", json!({}));
+    let r = run(&mut s, "solid.extrude", json!({"sketch": "R", "distance": "10", "operation": "new_body", "body_name": "Ribs"}));
+    assert_eq!(r["created_bodies"], json!(["Ribs", "Ribs (2)", "Ribs (3)"]), "{r}");
+}
+
+/// A design saved before format 14 with fewer stored body names than bodies (#373) opens and
+/// evaluates: the first body takes its stored name, and every body has a name of its own. (The
+/// names the others had when it was saved are not promised.)
+#[test]
+fn a_design_saved_before_format_14_with_fewer_body_names_opens_and_names_every_body() {
+    let mut s = Session::default();
+    run(&mut s, "sketch.create", json!({"plane": "XY", "name": "R"}));
+    for x in [0, 10, 20] {
+        run(&mut s, "sketch.rectangle.two_point", json!({"p0": [x, 0], "p1": [x + 5, 30]}));
+    }
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "solid.extrude", json!({"sketch": "R", "distance": "10", "operation": "new_body", "body_name": "Ribs"}));
+    let mut legacy: Value = serde_json::from_str(&s.doc.to_json()).unwrap();
+    legacy["format"] = json!("solidcraft/13");
+    let extrude = legacy["features"].as_array_mut().unwrap().iter_mut().find(|f| f["type"] == "extrude").unwrap();
+    extrude["body_names"] = json!(["Ribs"]);
+    let dir = std::env::temp_dir().join(format!("solidcraft-373-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let design = dir.join("ribs.solidcraft");
+    std::fs::write(&design, legacy.to_string()).unwrap();
+    let mut old = Session::default();
+    run(&mut old, "doc.open", json!({"path": design.to_string_lossy()}));
+    assert!(old.model.results.iter().all(|r| r.error.is_none()), "{:?}", old.model.results);
+    let names: Vec<String> = old.model.state().bodies.iter().map(|b| b.name.clone()).collect();
+    assert_eq!((names.len(), names.first().map(String::as_str)), (3, Some("Ribs")), "{names:?}");
+    assert_eq!(names.iter().collect::<std::collections::BTreeSet<_>>().len(), 3, "{names:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// R21 on the bottom front edge of a 50 x 50 x 20 block overflows the 20 mm front face (its circle
+/// about (y, z) = (21, 21) reaches the top only at y = 21 - sqrt(440)) and goes first; the front
+/// left upright, picked with it, lies wholly in what it removes (every (0, 0, z) is outside that
+/// circle), so it is gone: not rounded, and the feature says so. The block is R21's alone: the
+/// section loses 20 (21 - sqrt(440)) + int_0^sqrt(440) (21 - sqrt(441 - u^2)) du, along 50.
+#[test]
+fn fillet_edge_removed_by_a_larger_overflowing_round_is_noted() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 50, "width": 50, "height": 20}));
+    let out = run(&mut s, "solid.fillet", json!({"edges": [[25, 0, 0], [0, 0, 10]], "radius": 21, "tangent_chain": false, "name": "Round"}));
+    let w = 440f64.sqrt();
+    let f = 0.5 * (w * (441.0 - w * w).sqrt() + 441.0 * (w / 21.0).asin());
+    let lost = 20.0 * (21.0 - w) + 21.0 * w - f;
+    let want = 50.0 * 50.0 * 20.0 - 50.0 * lost;
+    assert!(rel(volume(&mut s), want) < 1e-9, "{} vs {want}", volume(&mut s));
+    let id = out["feature"].as_u64().unwrap();
+    let warning = s.model.result(id).and_then(|r| r.warning.clone()).unwrap_or_default();
+    assert_eq!(warning, "the edge at (0, 0, 10) was removed by the larger round, so it is not rounded");
+}
+
+/// #16768: a 50 x 35 x 5 plate with a boss 1 mm high, a circular segment (a chord on y = 5.5 and
+/// an arc over it), its arc-side top edge rounded at 1 mm. Rounding the flat side's top edge and
+/// the two short edges that run down from its ends (the arc round's edges on the flat wall) at 1
+/// mm asked a ball as large as the arc round's own radius to roll along the round, whose offset
+/// collapses to a curve: it failed with the bare status 1001. It is refused at once, saying
+/// why.
+fn segment_boss_with_arc_round() -> Session {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 50, "width": 35, "height": 5}));
+    run(&mut s, "sketch.create", json!({"plane": {"origin": [0, 0, 5], "x_dir": [1, 0, 0], "y_dir": [0, 1, 0]}}));
+    run(&mut s, "sketch.line", json!({"points": [[11, 5.5], [40.004310024546356, 5.5]]}));
+    run(
+        &mut s,
+        "sketch.arc.three_point",
+        json!({"start": [40.004310024546356, 5.5], "end": [11, 5.5], "through": [25.502155012273178, 13.007100059797995]}),
+    );
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "solid.extrude", json!({"distance": 1, "operation": "join"}));
+    run(&mut s, "solid.fillet", json!({"edges": [[25.502155, 13.0071, 6]], "radius": 1}));
+    s
+}
+
+#[test]
+fn a_round_as_large_as_the_round_it_runs_along_is_refused_not_failed() {
+    let flat_and_ends = json!([[25.502155, 5.5, 6], [11.419996686869673, 5.5, 5.748661225447015], [39.584311999041034, 5.5, 5.748656748207975]]);
+    // The flat edge alone builds at 1 mm (its round meets the wall's foot exactly).
+    let mut s = segment_boss_with_arc_round();
+    assert!(s.execute("solid.fillet", &json!({"edges": [[25.502155, 5.5, 6]], "radius": 1, "tangent_chain": false})).is_ok());
+    // With the two edges that run on from it, a ball of the arc round's radius cannot roll: refused,
+    // with the chain off and (the chain being those edges) on.
+    for chain in [false, true] {
+        let mut s = segment_boss_with_arc_round();
+        let picks = if chain { json!([[25.502155, 5.5, 6]]) } else { flat_and_ends.clone() };
+        let e = s.execute("solid.fillet", &json!({"edges": picks, "radius": 1, "tangent_chain": chain})).unwrap_err().to_string();
+        assert!(!e.contains("1001"), "chain {chain}: {e}");
+        assert!(e.contains("larger than the faces beside its edges allow"), "chain {chain}: {e}");
+    }
+}
+
+/// #17224: a sphere of radius 25 with a cylinder of radius 15 cut through it along Y, its axis 10.1
+/// above the centre, so the cylinder comes out at the top and meets the sphere in one loop of three
+/// edges (split where the cylinder's seam, at +X, crosses it). Rounding the loop, the two rounds
+/// that meet at a seam vertex end on one section where their contact lines cross the seam. The
+/// ball touching the cylinder on the seam (x = 15, z = 10.1) and the sphere inside has radius
+/// (297.99 - y^2) / 80, at most 3.725: a larger round's contact line never reaches the seam, and
+/// it failed there with "Unable to Compute Geometry". It is refused naming the largest radius
+/// that fits (297.99 / 80 less the fit margin, 3.724 mm, which builds); 2 mm builds as before.
+fn sphere_with_a_cylindrical_cut() -> Session {
+    let mut s = Session::default();
+    run(&mut s, "sketch.create", json!({"plane": "XZ", "flip": true}));
+    run(&mut s, "sketch.arc.center_point", json!({"center": [0, 0], "start": [0, 25], "end": [0, -25]}));
+    run(&mut s, "sketch.line", json!({"points": [[0, 25], [0, -25]]}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "solid.revolve", json!({"axis": {"curve": "l1"}, "angle": "360 deg"}));
+    run(&mut s, "sketch.create", json!({"plane": "XZ", "flip": true}));
+    run(&mut s, "sketch.circle.center", json!({"center": [0, 10.1], "radius": 15}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "solid.extrude", json!({"distance": 60, "direction": "symmetric", "operation": "cut"}));
+    s
+}
+
+#[test]
+fn a_round_whose_contact_line_misses_the_seam_it_joins_across_names_the_radius_that_fits() {
+    let loop_edges = json!([
+        [-11.698264765965028, -22.08234508421787, 0.7117938036342516],
+        [2.716453680812133, 0, 24.851978818427593],
+        [-11.69826476596502, 22.08234508421787, 0.7117938036342424]
+    ]);
+    let mut s = sphere_with_a_cylindrical_cut();
+    run(&mut s, "solid.fillet", json!({"edges": loop_edges, "radius": 2}));
+    assert!(rel(volume(&mut s), 36554.03) < 1e-5, "{}", volume(&mut s));
+    // The kernel's own refusal: without the search that builds candidates to confirm the size.
+    let mut s = sphere_with_a_cylindrical_cut();
+    s.set_validation(solidcraft_kernel::Validation::Off);
+    let e = s.execute("solid.fillet", &json!({"edges": loop_edges, "radius": 6})).unwrap_err().to_string();
+    assert!(!e.contains("Unable to Compute Geometry"), "{e}");
+    assert!(e.contains("larger than the faces beside its edges allow"), "{e}");
+    // The size named: the largest ball touching the seam, 297.99 / 80 at y = 0, less the fit
+    // margin (a thousand of the edge's tolerances, about 1.2e-5 here: 0.012).
+    let named: f64 = e
+        .split_once("the largest radius that fits is ")
+        .and_then(|(_, rest)| rest.split_once(" mm"))
+        .and_then(|(n, _)| n.parse().ok())
+        .unwrap_or_else(|| panic!("no radius named: {e}"));
+    let bound = 297.99 / 80.0;
+    assert!(named < bound && bound - named < 0.02, "named {named}, bound {bound}: {e}");
+    // The size named builds: its contact line crosses the seam just inside the bound.
+    let mut s = sphere_with_a_cylindrical_cut();
+    if let Err(e) = s.execute("solid.fillet", &json!({"edges": loop_edges, "radius": named})) {
+        panic!("the named radius {named} does not build: {e}");
+    }
+    let v = volume(&mut s);
+    assert!(v > 0.0 && v < 36554.03, "{v}");
+}
+
+fn block_with_a_square_notch() -> Session {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 60, "width": 40, "height": 25, "center": [0, 0, 12.5], "operation": "new", "body_name": "Base"}));
+    run(&mut s, "sketch.create", json!({"plane": "XY", "name": "NotchSketch1", "offset": 25}));
+    run(&mut s, "sketch.rectangle.center", json!({"center": [0, 20], "corner": [2.4, 22.4]}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(
+        &mut s,
+        "solid.extrude",
+        json!({"sketch": "NotchSketch1", "distance": 12.5, "direction": "negative", "operation": "cut", "targets": ["Base"]}),
+    );
+    s
+}
+
+/// #18545: the top loop of a block with a 4.8 mm square notch in an edge, chamfered 4 and 2 mm,
+/// failed inside the blend (status 1001): the notch's side walls are 2.4 mm long, too short for
+/// the 4 mm side. It is refused naming the largest scale of the two distances that builds
+/// (2.4 / 4 less one step, 0.599); that scale builds, and 2 by 1 mm builds as before.
+#[test]
+fn an_unequal_chamfer_too_large_for_a_notch_names_the_scale_that_fits() {
+    let edges =
+        json!([[30, -10, 25], [-30, 10, 25], [-15, -20, 25], [16.2, 20, 25], [-16.2, 20, 25], [2.4, 18.8, 25], [-2.4, 18.8, 25], [0, 17.6, 25]]);
+    let chamfer = |d1: f64, d2: f64| {
+        let mut s = block_with_a_square_notch();
+        s.execute("solid.chamfer", &json!({"edges": edges, "distance": d1, "distance2": d2, "body": "Base"})).map(|_| ()).map_err(|e| e.to_string())
+    };
+    assert_eq!(chamfer(2.0, 1.0), Ok(()));
+    let e = chamfer(4.0, 2.0).unwrap_err();
+    assert!(!e.contains("1001"), "{e}");
+    assert!(e.contains("larger than the faces beside its edges allow"), "{e}");
+    let scale: f64 = e
+        .split_once("the largest that fits is ")
+        .and_then(|(_, rest)| rest.split_once(" times the distances given"))
+        .and_then(|(n, _)| n.parse().ok())
+        .unwrap_or_else(|| panic!("no scale named: {e}"));
+    assert!((scale - 0.599).abs() < 1e-9, "{e}");
+    assert_eq!(chamfer(4.0 * scale, 2.0 * scale), Ok(()), "the scale named builds");
+}
+
+/// #19691: a 1 mm extrusion of a closed spline with a 0.48 mm notch in its top rim 0.0001 mm
+/// from the spline's seam, its top loop chamfered 0.4 by 0.2 mm, failed with a bare "status
+/// 1007: the chamfer size": the notch's rim was taken to open to a half turn, where an unequal
+/// chamfer folds. Its faces meet square; no scale of the sizes builds beside the sliver the
+/// notch leaves, so it is refused as too large, saying the smaller scales tried do not build.
+#[test]
+fn an_unequal_chamfer_beside_a_notch_at_a_spline_s_seam_is_refused_by_its_size() {
+    let mut s = Session::default();
+    let points = [[500.0, 0.0], [379.0, 75.7], [0.0, 90.0], [-379.0, 75.7], [-500.0, 0.0], [-329.0, -65.7], [-0.0, -110.0], [329.0, -65.7]];
+    run(&mut s, "sketch.create", json!({"name": "Outline", "plane": {"origin": [0, 0, 0], "x_dir": [1, 0, 0], "y_dir": [0, 1, 0]}}));
+    run(&mut s, "sketch.spline.fit_point", json!({"periodic": true, "points": points}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "solid.extrude", json!({"sketch": "Outline", "distance": 1.0, "operation": "new", "body_name": "Part"}));
+    let notch = json!({"radius": 0.24, "height": 0.5, "base": [499.97443718225014, 0.23873292279060757, 0.5], "axis": "Z", "operation": "cut", "targets": ["Part"]});
+    run(&mut s, "solid.cylinder", notch);
+    let edges = json!([[0.0, -110.0, 1.0], [499.7360050660453, 0.2113444952693031, 1.0]]);
+    let e = s.execute("solid.chamfer", &json!({"edges": edges, "distance": 0.4, "distance2": 0.2})).unwrap_err().to_string();
+    assert!(!e.contains("1007"), "{e}");
+    assert!(e.contains("larger than the faces beside its edges allow"), "{e}");
+    assert!(e.contains("scales of its sizes tried builds"), "{e}");
+}
+
+/// #18823: a block whose front half slopes at 45 degrees, a groove down the slope (a cylinder of
+/// radius 3, its axis 2.5 above the slope) with both edges rounded 1 mm, and a slot slanted 65
+/// degrees in plan whose inner wall runs into the round and the groove. The wall's top edge, where
+/// it meets the slope, runs on tangentially into its edges with the round and the groove, and a
+/// chamfer with tangent propagation blends the three. `window` cuts a window 0.2 wide and 0.5
+/// tall, 1 deep, square into that wall, centred `s` along the wall from its back corner, its top
+/// edge at `top`.
+fn slot_wall_beside_a_rounded_groove(window: Option<(f64, f64)>) -> Session {
+    let mut s = Session::default();
+    run(&mut s, "sketch.create", json!({"plane": "YZ"}));
+    run(&mut s, "sketch.line", json!({"closed": true, "points": [[-10, 0], [10, 0], [10, 15], [0, 15], [-10, 5]]}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "solid.extrude", json!({"distance": 20, "direction": "symmetric"}));
+    run(&mut s, "sketch.create", json!({"plane": "YZ"}));
+    run(&mut s, "sketch.line", json!({"closed": true, "points": [[-18.8388, -0.3033], [2.3744, 20.9099], [4.4957, 18.7886], [-16.7175, -2.4246]]}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "solid.revolve", json!({"axis": "l1", "operation": "cut"}));
+    run(&mut s, "solid.fillet", json!({"edges": [[1.6583, -5, 10], [-1.6583, -5, 10]], "radius": 1}));
+    run(&mut s, "sketch.create", json!({"plane": "XY", "offset": 2}));
+    run(&mut s, "sketch.line", json!({"closed": true, "points": [[3.2133, -11.3595], [5.0236, -11.3595], [3.1218, -7.2811], [1.3115, -7.2811]]}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "solid.extrude", json!({"distance": 15, "operation": "cut"}));
+    if let Some((at, top)) = window {
+        // along the wall from its back corner towards the front, and the wall's normal into the slot
+        let (u, n) = ((0.4226183, -0.9063078), (0.9063078, 0.4226183));
+        let (x, y) = (1.3115 + u.0 * at, -7.2811 + u.1 * at);
+        let origin = json!([x + 0.5 * n.0, y + 0.5 * n.1, 0]);
+        run(&mut s, "sketch.create", json!({"plane": {"origin": origin, "x_dir": [u.0, u.1, 0], "y_dir": [0, 0, 1]}}));
+        run(&mut s, "sketch.line", json!({"closed": true, "points": [[-0.1, top - 0.5], [0.1, top - 0.5], [0.1, top], [-0.1, top]]}));
+        run(&mut s, "sketch.finish", json!({}));
+        run(&mut s, "solid.extrude", json!({"distance": 1.5, "operation": "cut"}));
+    }
+    s
+}
+
+/// The chain's pick, and the window's top edge at its middle.
+fn slot_wall_chamfer(window: Option<(f64, f64)>, distance: f64) -> Value {
+    let mut edges = vec![json!([2.4395, -9.7, 5.3])];
+    if let Some((at, top)) = window {
+        edges.push(json!([1.3115 + 0.4226183 * at, -7.2811 - 0.9063078 * at, top]));
+    }
+    json!({"edges": edges, "distance": distance})
+}
+
+#[test]
+fn a_chamfer_along_a_tangent_chain_into_a_round_is_not_refused_as_overlapping_itself() {
+    // The chain alone at 0.4 mm builds: its chamfers meet at shared sections that lie well before
+    // the edges' vertices on the slanted wall, and the band check no longer takes the third one's
+    // rail beside the end of the first edge for an overlap. Removed: 0.4438 (the case's interval
+    // in solidcore's corpus, worked out independently).
+    let mut s = slot_wall_beside_a_rounded_groove(None);
+    let before = volume(&mut s);
+    run(&mut s, "solid.chamfer", slot_wall_chamfer(None, 0.4));
+    let removed = before - volume(&mut s);
+    assert!((removed - 0.44378).abs() < 0.003, "{removed}");
+    // A window whose chamfer stays clear of the chain's on the wall (0.07 apart) builds with it,
+    // each removing what it does alone.
+    let mut s = slot_wall_beside_a_rounded_groove(Some((1.65, 5.10)));
+    let before = volume(&mut s);
+    run(&mut s, "solid.chamfer", slot_wall_chamfer(Some((1.65, 5.10)), 0.4));
+    let removed = before - volume(&mut s);
+    assert!((removed - 0.44378 - 0.016).abs() < 0.003, "{removed}");
+}
+
+#[test]
+fn a_chamfer_whose_band_overlaps_a_chain_chamfer_is_refused_naming_a_size_that_builds() {
+    // Windows whose chamfer reaches past the chain's rail on the wall: by about 0.01, 3e-4 (as
+    // the band check samples it: less than the ten tolerances, 4e-4, it let through before, where
+    // the trim leaked), 0.016 and 0.029 mm. Each is refused as too large, not failed, naming a
+    // size that builds.
+    for window in [(1.75, 5.10), (1.80, 5.05), (1.90, 4.98), (1.95, 4.95)] {
+        let mut s = slot_wall_beside_a_rounded_groove(Some(window));
+        let e = s.execute("solid.chamfer", &slot_wall_chamfer(Some(window), 0.4)).unwrap_err().to_string();
+        assert!(!e.contains("1001") && !e.contains("leak"), "{window:?}: {e}");
+        assert!(e.contains("larger than the faces beside its edges allow"), "{window:?}: {e}");
+        let named: f64 = e
+            .split_once("the largest distance that fits is ")
+            .and_then(|(_, rest)| rest.split_once(" mm"))
+            .and_then(|(n, _)| n.parse().ok())
+            .unwrap_or_else(|| panic!("{window:?}: no distance named: {e}"));
+        assert!(named < 0.4 && named > 0.35, "{window:?}: {named}: {e}");
+        let mut s = slot_wall_beside_a_rounded_groove(Some(window));
+        if let Err(e) = s.execute("solid.chamfer", &slot_wall_chamfer(Some(window), named)) {
+            panic!("{window:?}: the named distance {named} does not build: {e}");
+        }
+    }
+}
+
+#[test]
+fn fillet_fit_reduce_uses_the_largest_radius_that_fits() {
+    // #293: 3.5 is too large for the 6 mm end faces of a 14 x 6 x 10 box; reduce gives 3 (a full
+    // round), says so, and refits when the box changes.
+    let mut s = Session::default();
+    run(&mut s, "parameters.add", json!({"name": "w", "expression": "6 mm"}));
+    run(&mut s, "solid.box", json!({"length": 14, "width": "w", "height": 10, "corner": [14, 0, 0]}));
+    let mids = json!([[14, 0, 5], [28, 0, 5], [14, 6, 5], [28, 6, 5]]);
+    // The exact fit refuses it, naming the largest radius that fits.
+    let e = s.execute("solid.fillet", &json!({"edges": mids, "radius": 3.5})).unwrap_err().to_string();
+    assert!(e.contains("the largest radius that fits is 3 mm"), "{e}");
+    let out = run(&mut s, "solid.fillet", json!({"edges": mids, "radius": 3.5, "fit": "reduce", "name": "Round"}));
+    assert_eq!(out["radius_applied"].as_f64(), Some(3.0), "{out}");
+    let full = 840.0 - (4.0 - PI) * 9.0 * 10.0;
+    assert!(rel(volume(&mut s), full) < 2e-4, "{} vs {full}", volume(&mut s));
+    let id = out["feature"].as_u64().unwrap();
+    let warning = s.model.result(id).and_then(|r| r.warning.clone()).unwrap_or_default();
+    assert!(warning.contains("reduced to 3 mm"), "{warning}");
+    // Wider: the requested 3.5 fits, nothing is reduced.
+    let r = run(&mut s, "parameters.change", json!({"name": "w", "expression": "8 mm"}));
+    assert_eq!(r["errors"].as_array().map(Vec::len), Some(0), "{r}");
+    assert_eq!(s.model.result(id).and_then(|r| r.state.fitted_radius(id)), None);
+    assert!(s.model.result(id).and_then(|r| r.warning.clone()).is_none());
+    // Saved only when set.
+    let json = serde_json::to_string(&s.doc.features).unwrap();
+    assert_eq!(json.matches("\"fit\":\"reduce\"").count(), 1, "{json}");
+    // An unknown mode is refused, and so are reduce and taper with a radius that is not constant.
+    assert!(s.execute("solid.fillet", &json!({"edges": mids, "radius": 1, "fit": "stretch"})).is_err());
+    assert!(s.execute("solid.fillet", &json!({"edges": mids, "radius": 1, "fit": "reduce", "type": "chord"})).is_err());
+    assert!(s.execute("solid.fillet", &json!({"edges": mids, "radius": 1, "fit": "taper", "type": "chord"})).is_err());
+}
+
+/// A plate 15 high whose top narrows from 20 to `tip` mm along 40 mm (a wedge at 0), and, with
+/// `wall`, a wall standing behind its slanted side from z = -15 to 30, which the plate's top and
+/// bottom end on in concave edges: a blend of its front edges can't run past them.
+fn tapering_plate(tip: f64, wall: bool) -> Session {
+    let mut s = Session::default();
+    run(&mut s, "sketch.create", json!({"plane": "XY"}));
+    let pts = if tip > 0.0 { json!([[0, 0], [40, 0], [40, tip], [0, 20]]) } else { json!([[0, 0], [40, 0], [0, 20]]) };
+    run(&mut s, "sketch.line", json!({"points": pts, "closed": true}));
+    run(&mut s, "solid.extrude", json!({"distance": 15}));
+    if wall {
+        run(&mut s, "sketch.create", json!({"plane": {"origin": [0, 0, -15], "x_dir": [1, 0, 0], "y_dir": [0, 1, 0]}}));
+        run(&mut s, "sketch.line", json!({"points": [[40, tip], [0, 20], [0, 30], [40, 30]], "closed": true}));
+        run(&mut s, "solid.extrude", json!({"distance": 45, "operation": "join"}));
+        assert_eq!(s.model.state().bodies.len(), 1);
+    }
+    s
+}
+
+/// [`tapering_plate`]'s volume: the plate, and the wall's 20 (40 − tip) section along 45.
+fn tapering_plate_volume(tip: f64, wall: bool) -> f64 {
+    (40.0 * (20.0 + tip) / 2.0) * 15.0 + if wall { 20.0 * (40.0 - tip) * 45.0 } else { 0.0 }
+}
+
+#[test]
+fn fillet_fit_taper_follows_the_room_along_the_edge() {
+    // #293: the top front edge of a plate whose top narrows from 20 to `tip` mm along 40 mm,
+    // against a wall. At a 2 mm tip it can't take 3 mm; taper keeps 3 where it fits and comes
+    // down to 0.9 of the 2 mm there. With an 8 mm tip 3 fits and stays constant. The warning
+    // says what was done.
+    let (k, edge) = (1.0 - PI / 4.0, json!([[20, 0, 15]]));
+    let warning = |s: &Session, out: &Value| out["feature"].as_u64().and_then(|id| s.model.result(id)).and_then(|r| r.warning.clone());
+
+    let mut s = tapering_plate(2.0, true);
+    assert!(s.execute("solid.fillet", &json!({"edges": edge, "radius": 3})).is_err());
+    let out = run(&mut s, "solid.fillet", json!({"edges": edge, "radius": 3, "fit": "taper"}));
+    let w = warning(&s, &out).unwrap_or_default();
+    assert!(w.contains("tapers to the room on 1 of 1 edges, down to 1.8 mm"), "{w}");
+    // Between the material a constant 1.8 and a constant 3 would remove.
+    let (v, full) = (volume(&mut s), tapering_plate_volume(2.0, true));
+    assert!(v < full - k * 1.8 * 1.8 * 40.0 && v > full - k * 9.0 * 40.0, "{v}");
+    let json = serde_json::to_string(&s.doc.features).unwrap();
+    assert_eq!(json.matches("\"fit\":\"taper\"").count(), 1, "{json}");
+
+    let mut s = tapering_plate(8.0, true);
+    let out = run(&mut s, "solid.fillet", json!({"edges": edge, "radius": 3, "fit": "taper"}));
+    assert_eq!(warning(&s, &out), None);
+    assert!(rel(volume(&mut s), tapering_plate_volume(8.0, true) - k * 9.0 * 40.0) < 2e-4);
+
+    // Without the wall the 2 mm top's far edge is a cliff: R3 runs over it and is cut from the
+    // plate as if the top went on (the blend-overflow decision, 237f0ae74), so it fits and the
+    // taper leaves it constant. At x the plate's section is [0, w] × [0, 15], w = 20 − 0.45 x:
+    // the round takes its whole (1 − π/4)·9 where w >= 3, and where w < 3 the part of the
+    // 3 × 3 corner outside the circle about (3, 3) with s <= w, 3 w − (F(3) − F(3 − w)),
+    // F(v) = (v √(9 − v²) + 9 asin(v/3)) / 2.
+    let mut s = tapering_plate(2.0, false);
+    let out = run(&mut s, "solid.fillet", json!({"edges": edge, "radius": 3, "fit": "taper"}));
+    assert_eq!(warning(&s, &out), None);
+    let f = |v: f64| 0.5 * (v * (9.0 - v * v).max(0.0).sqrt() + 9.0 * (v / 3.0).asin());
+    let n = 20000;
+    let taken: f64 = (0..n)
+        .map(|i| {
+            let w = 20.0 - 0.45 * 40.0 * (i as f64 + 0.5) / n as f64;
+            if w >= 3.0 { 9.0 * k } else { 3.0 * w - (f(3.0) - f(3.0 - w)) }
+        })
+        .sum::<f64>()
+        * 40.0
+        / n as f64;
+    let want = tapering_plate_volume(2.0, false) - taken;
+    assert!(rel(volume(&mut s), want) < 1e-6, "{} vs {want}", volume(&mut s));
+}
+
+#[test]
+fn fillet_fit_taper_closes_to_a_point() {
+    // #293: a wedge against a wall, its top closing to a point at x = 40: no constant radius
+    // fits there, and taper comes down to 0 at the point.
+    let mut s = tapering_plate(0.0, true);
+    assert!(s.execute("solid.fillet", &json!({"edges": [[20, 0, 15]], "radius": 16})).is_err());
+    let out = run(&mut s, "solid.fillet", json!({"edges": [[20, 0, 15]], "radius": 16, "fit": "taper"}));
+    let w = out["feature"].as_u64().and_then(|id| s.model.result(id)).and_then(|r| r.warning.clone()).unwrap_or_default();
+    assert!(w.contains("on 1 of 1 edges, down to 0 mm"), "{w}");
+}
+
+#[test]
+fn spline_fillet_takes_over_a_taper() {
+    // A tapered fillet keeps each edge's radius spline; given back as a `spline` fillet it makes
+    // the same part, and its control radii are then the user's to change.
+    let mut s = tapering_plate(2.0, true);
+    let edge = json!([[20, 0, 15]]);
+    let out = run(&mut s, "solid.fillet", json!({"edges": edge, "radius": 3, "fit": "taper"}));
+    let id = out["feature"].as_u64().unwrap();
+    let tapered = s.model.result(id).and_then(|r| r.state.tapered(id).map(<[_]>::to_vec)).unwrap();
+    let [(_, t)] = &tapered[..] else { panic!("{tapered:?}") };
+    let tapered_volume = volume(&mut s);
+    let radii: Vec<Value> = t.spline.radii.iter().skip(1).map(|r| json!(r)).collect();
+    let spline = json!({"edges": edge, "radius": t.spline.radii[0], "type": "spline", "start": [t.start.x, t.start.y, t.start.z], "knots": t.spline.knots, "radii": radii});
+    run(&mut s, "timeline.redefine", json!({"feature": id, "command": "solid.fillet", "params": spline}));
+    assert!(rel(volume(&mut s), tapered_volume) < 1e-9, "{} vs {tapered_volume}", volume(&mut s));
+    let json = serde_json::to_string(&s.doc.features).unwrap();
+    assert!(json.contains("\"type\":\"spline\""), "{json}");
+    // A control radius raised in the middle: more material goes.
+    let mut raised = spline.clone();
+    raised["radii"][2] = json!("4 mm");
+    run(&mut s, "timeline.redefine", json!({"feature": id, "command": "solid.fillet", "params": raised}));
+    assert!(volume(&mut s) < tapered_volume);
+    // Knots that don't match the radii are refused.
+    let mut bad = spline;
+    bad["knots"] = json!([0, 1]);
+    assert!(s.execute("solid.fillet", &bad).is_err());
+}
+
+#[test]
+fn fillet_fit_reduce_keeps_the_radius_where_it_fits() {
+    // A 14 x 6 x 10 post on a block: its four vertical edges can't take 3.5 (two rounds on its
+    // 6 mm ends would cross), a corner of the block far from it can. Only the post's edges are
+    // reduced, to 3 (a full round); the reply gives each edge's radius.
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 40, "width": 30, "height": 20}));
+    run(&mut s, "solid.box", json!({"length": 14, "width": 6, "height": 10, "corner": [2, 2, 20], "operation": "join"}));
+    assert_eq!(s.model.state().bodies.len(), 1);
+    let post = [[2.0, 2.0, 25.0], [16.0, 2.0, 25.0], [2.0, 8.0, 25.0], [16.0, 8.0, 25.0]];
+    let edges = json!([post[0], post[1], post[2], post[3], [40, 0, 10]]);
+    let out = run(&mut s, "solid.fillet", json!({"edges": edges, "radius": 3.5, "fit": "reduce"}));
+    assert_eq!(out["radius_applied"].as_f64(), Some(3.0), "{out}");
+    let each: Vec<(Vec<f64>, f64)> = out["radii_applied"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| (x["edge"].as_array().unwrap().iter().filter_map(Value::as_f64).collect(), x["radius"].as_f64().unwrap()))
+        .collect();
+    let mut want_each: Vec<(Vec<f64>, f64)> = post.iter().map(|p| (p.to_vec(), 3.0)).collect();
+    want_each.push((vec![40.0, 0.0, 10.0], 3.5));
+    assert_eq!(each, want_each, "{out}");
+    // The post's full round takes (4 − π)·9 of its section along its 10 mm height, the block's
+    // corner (1 − π/4)·3.5² along 20.
+    let removed = (4.0 - PI) * 9.0 * 10.0 + (1.0 - PI / 4.0) * 3.5 * 3.5 * 20.0;
+    let want = 40.0 * 30.0 * 20.0 + 14.0 * 6.0 * 10.0 - removed;
+    assert!(rel(volume(&mut s), want) < 2e-4, "{} vs {want}", volume(&mut s));
+    let id = out["feature"].as_u64().unwrap();
+    let warning = s.model.result(id).and_then(|r| r.warning.clone()).unwrap_or_default();
+    assert!(warning.contains("on 4 of 5 edges"), "{warning}");
+}
+
+/// A 2 mm fin's top edge at R4 runs over the fin's top, past its far edge (a cliff): it is cut
+/// as if the top went on (the blend-overflow decision), so with `fit: reduce` nothing is reduced.
+/// The fin's section loses the 4 x 4 square at its edge less the quarter disc about (17, 26)
+/// inside the fin (x >= 19), as `fillet_max_each_reduces_only_where_the_radius_does_not_fit`
+/// in the kernel finds it.
+#[test]
+fn fillet_fit_reduce_keeps_a_round_over_a_cliff() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 40, "width": 30, "height": 20}));
+    run(&mut s, "solid.box", json!({"length": 2, "width": 30, "height": 10, "corner": [19, 0, 20], "operation": "join"}));
+    let out = run(&mut s, "solid.fillet", json!({"edges": [[21, 15, 30], [40, 0, 10]], "radius": 4, "fit": "reduce"}));
+    assert_eq!(out["radius_applied"].as_f64(), None, "{out}");
+    let id = out["feature"].as_u64().unwrap();
+    assert_eq!(s.model.result(id).and_then(|r| r.warning.clone()), None);
+    let disc = |a: f64| 0.5 * (a * (16.0 - a * a).max(0.0).sqrt() + 16.0 * (a / 4.0).asin());
+    let removed = (2.0 * 4.0 - (disc(4.0) - disc(2.0))) * 30.0 + (1.0 - PI / 4.0) * 16.0 * 20.0;
+    let want = 40.0 * 30.0 * 20.0 + 2.0 * 30.0 * 10.0 - removed;
+    assert!(rel(volume(&mut s), want) < 1e-6, "{} vs {want}", volume(&mut s));
+}
+
+#[test]
+fn a_pattern_of_a_reduced_fillet_rounds_each_copy_alike() {
+    // #293: a 6 mm wide post on a plate, its four vertical edges at 3.5 reduced to 3, patterned
+    // three times: every copy is a full round.
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 60, "width": 20, "height": 2}));
+    run(&mut s, "solid.box", json!({"length": 14, "width": 6, "height": 10, "corner": [2, 7, 2], "operation": "join", "name": "Post"}));
+    let mids = json!([[2, 7, 7], [16, 7, 7], [2, 13, 7], [16, 13, 7]]);
+    run(&mut s, "solid.fillet", json!({"edges": mids, "radius": 3.5, "fit": "reduce", "name": "Round"}));
+    run(&mut s, "solid.pattern.rectangular", json!({"features": ["Post", "Round"], "dir1": [1, 0, 0], "count1": 3, "spacing1": 20}));
+    let expect = 60.0 * 20.0 * 2.0 + 3.0 * (840.0 - (4.0 - PI) * 9.0 * 10.0);
+    assert!(rel(volume(&mut s), expect) < 2e-4, "{} vs {expect}", volume(&mut s));
+}
+
+#[test]
+fn extrude_taper_help_explains_both_signs() {
+    let mut s = Session::default();
+    let help = run(&mut s, "engine.describe", json!({"command": "solid.extrude"}));
+    for text in [help["params"].as_str().unwrap(), help["input"]["properties"]["taper"]["description"].as_str().unwrap()] {
+        assert!(text.contains("positive: outward") && text.contains("negative: inward"), "{text}");
+    }
+}
+
+#[test]
+fn extrude_taper_sign_sets_far_face_size() {
+    for angle in [5.0_f64, -5.0] {
+        let mut s = Session::default();
+        run(&mut s, "sketch.create", json!({"plane": "XY"}));
+        run(&mut s, "sketch.rectangle.two_point", json!({"p0": [0, 0], "p1": [10, 10]}));
+        run(&mut s, "sketch.finish", json!({}));
+        run(&mut s, "solid.extrude", json!({"distance": 10, "taper": format!("{angle} deg"), "body_name": "Tapered"}));
+        let faces = run(&mut s, "model.faces", json!({"body": "Tapered"}));
+        let far = faces["faces"].as_array().unwrap().iter().find(|f| (f["centroid"][2].as_f64().unwrap() - 10.0).abs() < 1e-6).unwrap();
+        let width = 10.0 + 20.0 * angle.to_radians().tan();
+        let area = far["area"].as_f64().unwrap();
+        assert!((area - width * width).abs() < 1e-6, "{angle} deg: {far}");
+        assert_eq!(area > 100.0, angle > 0.0);
+    }
+}
+
+/// A taper on a profile of lines and an arc (#546). The D profile (back 9.2, sides 7.4, a
+/// half-round front R 4.6 tangent to them) grows by d = z · tan 5° with mitred corners:
+/// A(d) = A₀ + P·d + (2 + π/2)·d², integrated over the 10 mm height.
+#[test]
+fn tapered_extrude_of_a_profile_mixing_lines_and_an_arc() {
+    let mut s = Session::default();
+    run(&mut s, "sketch.create", json!({"plane": "XY", "name": "D"}));
+    run(&mut s, "sketch.line", json!({"points": [[0, 4.6], [-7.4, 4.6], [-7.4, -4.6], [0, -4.6]], "closed": false}));
+    run(&mut s, "sketch.arc.center_point", json!({"center": [0, 0], "start": [0, -4.6], "end": [0, 4.6]}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "solid.extrude", json!({"sketch": "D", "distance": 10, "taper": "5 deg"}));
+    let (t, h) = (5f64.to_radians().tan(), 10.0);
+    let (a0, p, k) = (7.4 * 9.2 + PI * 4.6 * 4.6 / 2.0, 2.0 * 7.4 + 9.2 + PI * 4.6, 2.0 + PI / 2.0);
+    let expect = a0 * h + p * t * h * h / 2.0 + k * t * t * h.powi(3) / 3.0;
+    assert!(rel(volume(&mut s), expect) < 1e-3, "{} vs {expect}", volume(&mut s));
+}
+
+/// A tapered extrude To a curved face ends on that face, as an untapered one does (#15820),
+/// not on a flat cap where the profile's middle meets it. A circle r 4 on XY, with or without a
+/// hole r 1.5, up to a ball R 10 at z 20. A wall r(z) = r₀ + s·z (s = tan of the taper for the
+/// outside, its negative for the hole, which the taper narrows as it grows the outside) meets
+/// the ball at z_c, the smaller root of r(z)² + (z − 20)² = R², so the column inside it is the
+/// frustum to z_c less the ball's cap below z_c, and the post is the outside's column less the
+/// hole's: the volumes below, worked out once from that (z_c 11.335 at +5°, 10.487 at −5°,
+/// 10.085 at −15°; the hole's 10.019 at +5°, 10.292 at −5°). Joined to the ball (4188.790)
+/// it adds just that. At −15° the outside would close at z 14.9 and at +5° the hole at z 17.1,
+/// both inside the ball: the tools only run as far as they must. A circle r 12 is wider than
+/// the ball where it starts and still meets it narrowing: at −10° at z_c 16.022, at −20° at
+/// 13.095, at −21° at 12.904, closing at z 31.26 just above the ball (its top at z 30); such a
+/// tool runs to the ball's far side. Growing at +5°, it holds the whole ball and is refused.
+#[test]
+fn tapered_extrude_to_a_curved_face_ends_on_it() {
+    let (b, c, big_r) = (1.5, 20.0, 10.0);
+    let setup = |a: f64, hole: bool| {
+        let mut s = Session::default();
+        run(&mut s, "solid.sphere", json!({"radius": big_r, "center": [0, 0, c], "body_name": "Ball"}));
+        run(&mut s, "sketch.create", json!({"plane": "XY", "name": "P"}));
+        run(&mut s, "sketch.circle.center", json!({"center": [0, 0], "radius": a}));
+        if hole {
+            run(&mut s, "sketch.circle.center", json!({"center": [0, 0], "radius": b}));
+        }
+        run(&mut s, "sketch.finish", json!({}));
+        s
+    };
+    let ball = 4188.790204786391;
+    let measure = |s: &mut Session, body: &str| run(s, "inspect.measure", json!({"bodies": [body]}))["bodies"][0].clone();
+    let topology = |m: &Value| (m["faces"].as_u64(), m["edges"].as_u64(), m["vertices"].as_u64(), m["kernel"]["shells"].as_u64());
+    for hole in [false, true] {
+        // Untapered, the straight path: the post's faces are its base, its sides and the ball's cap.
+        let mut s = setup(4.0, hole);
+        run(&mut s, "solid.extrude", json!({"sketch": "P", "to": [0, 0, c - big_r], "operation": "new", "body_name": "Post"}));
+        let straight = topology(&measure(&mut s, "Post"));
+        assert_eq!(straight.0, Some(if hole { 4 } else { 3 }), "{straight:?}");
+        let cones = if hole { 2 } else { 1 };
+        // At −15° the hole would grow into the outside before the ball: no hole there.
+        let posts: &[(f64, f64, f64)] = if hole {
+            &[(4.0, 5.0, 631.703987706579), (4.0, -5.0, 285.63157703482165)]
+        } else {
+            &[
+                (4.0, 5.0, 669.1892253335005),
+                (4.0, -5.0, 408.1381918962213),
+                (4.0, -15.0, 241.3566646562573),
+                (12.0, -10.0, 4765.092818474139),
+                (12.0, -20.0, 3612.7398353298513),
+                (12.0, -21.0, 3520.22820600382),
+            ]
+        };
+        for &(a, deg, post) in posts {
+            let taper = format!("{deg} deg");
+            let mut s = setup(a, hole);
+            run(&mut s, "solid.extrude", json!({"sketch": "P", "to": [0, 0, c - big_r], "taper": taper, "operation": "new", "body_name": "Post"}));
+            let m = measure(&mut s, "Post");
+            let got = m["volume_mm3"].as_f64().unwrap();
+            assert!(rel(got, post) < 1e-4, "{deg} deg, hole {hole}: {got} vs {post}");
+            assert_eq!(topology(&m), straight, "{deg} deg, hole {hole}: {m}");
+            assert_eq!(m["face_types"], json!({"cone": cones, "plane": 1, "sphere": 1}), "{deg} deg, hole {hole}: only the base is flat: {m}");
+            let mut s = setup(a, hole);
+            run(&mut s, "solid.extrude", json!({"sketch": "P", "to": [0, 0, c - big_r], "taper": taper, "operation": "join", "targets": ["Ball"]}));
+            assert_eq!(s.model.state().bodies.len(), 1, "{deg} deg, hole {hole}");
+            assert!(rel(volume(&mut s), ball + post) < 1e-4, "{deg} deg, hole {hole}: {} vs {}", volume(&mut s), ball + post);
+            // The ball's face, less the post's foot; with a hole also the ball's face in the hole.
+            let m = measure(&mut s, "Ball");
+            assert_eq!(m["face_types"], json!({"cone": cones, "plane": 1, "sphere": cones}), "{deg} deg, hole {hole}: {m}");
+            assert_eq!(m["kernel"]["shells"].as_u64(), Some(1), "{deg} deg, hole {hole}: {m}");
+        }
+    }
+    let mut s = setup(12.0, false);
+    let p = json!({"sketch": "P", "to": [0, 0, c - big_r], "taper": "5 deg", "operation": "new", "body_name": "Post"});
+    let e = s.execute("solid.extrude", &p).unwrap_err().to_string();
+    assert!(e.contains("reaches past the To face"), "{e}");
+}
+
+/// A feature that joins into a body creates none, and its reply says so; a primitive's reply
+/// names the body it made (#374).
+#[test]
+fn feature_replies_list_only_the_bodies_they_created() {
+    let mut s = Session::default();
+    let r = run(&mut s, "solid.box", json!({"length": 10, "width": 10, "height": 10, "body_name": "Base"}));
+    assert_eq!(r["created_bodies"], json!(["Base"]), "{r}");
+    run(&mut s, "sketch.create", json!({"plane": "XY", "name": "Boss"}));
+    run(&mut s, "sketch.circle.center", json!({"center": [5, 5], "radius": 2}));
+    run(&mut s, "sketch.finish", json!({}));
+    let r = run(&mut s, "solid.extrude", json!({"sketch": "Boss", "distance": "15", "operation": "join"}));
+    assert_eq!(r["created_bodies"], json!([]), "{r}");
+    assert_eq!(r["bodies"], json!(["Base"]), "{r}");
+}
+
+/// A feature reply also says which existing bodies it changed and which are gone, so a client
+/// that skips the full body list (MCP `batch` with `verbose: false`, #530) still sees every effect.
+#[test]
+fn feature_replies_list_the_bodies_they_changed_and_removed() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 10, "width": 10, "height": 10, "body_name": "A"}));
+    run(&mut s, "solid.box", json!({"length": 10, "width": 10, "height": 10, "corner": [20, 0, 0], "operation": "new", "body_name": "B"}));
+    run(&mut s, "solid.box", json!({"length": 10, "width": 10, "height": 10, "corner": [40, 0, 0], "operation": "new", "body_name": "C"}));
+    // A pocket in A changes A only.
+    let r = run(&mut s, "solid.box", json!({"length": 4, "width": 4, "height": 10, "corner": [3, 3, 5], "operation": "cut", "targets": ["A"]}));
+    assert_eq!((&r["created_bodies"], &r["changed_bodies"], &r["removed_bodies"]), (&json!([]), &json!(["A"]), &json!([])), "{r}");
+    // Joining C into B changes B and removes C.
+    let r = run(&mut s, "solid.combine", json!({"target": "B", "tools": ["C"], "operation": "join"}));
+    assert_eq!((&r["changed_bodies"], &r["removed_bodies"]), (&json!(["B"]), &json!(["C"])), "{r}");
+    // A new body changes nothing else.
+    let r = run(&mut s, "solid.box", json!({"length": 1, "width": 1, "height": 1, "corner": [0, 50, 0], "operation": "new", "body_name": "D"}));
+    assert_eq!((&r["created_bodies"], &r["changed_bodies"], &r["removed_bodies"]), (&json!(["D"]), &json!([]), &json!([])), "{r}");
+}
+
+/// Drafting a cylinder's side face 5° from the base plane makes a cone frustum (#547): radius 10
+/// at the base, 10 − 20 · tan 5° at the top.
+#[test]
+fn draft_on_a_cylinder_side_makes_a_frustum() {
+    let mut s = Session::default();
+    run(&mut s, "solid.cylinder", json!({"radius": 10, "height": 20}));
+    run(&mut s, "solid.draft", json!({"faces": [[10, 0, 10]], "angle": "5 deg", "neutral": "XY"}));
+    let (big, h) = (10.0, 20.0);
+    let small = big - h * 5f64.to_radians().tan();
+    let expect = PI * h / 3.0 * (big * big + big * small + small * small);
+    assert!(rel(volume(&mut s), expect) < 1e-3, "{} vs {expect}", volume(&mut s));
+}
+
+/// The copies added after a rename keep their numbers through undo/redo, save/reopen and a
+/// further count change; lowering the count drops the last copies (#372).
+#[test]
+fn pattern_copies_added_after_a_rename_keep_their_numbers() {
+    let mut s = Session::default();
+    let names = |s: &Session| -> Vec<String> { s.model.state().bodies.iter().map(|b| b.name.clone()).collect() };
+    run(&mut s, "solid.box", json!({"length": 10, "width": 10, "height": 10, "operation": "new_body", "body_name": "X"}));
+    run(&mut s, "solid.pattern.rectangular", json!({"bodies": ["X"], "dir1": [1, 0, 0], "count1": 3, "spacing1": 20, "name": "Pat"}));
+    run(&mut s, "body.rename", json!({"body": "X (2)", "name": "Second"}));
+    run(&mut s, "timeline.edit", json!({"feature": "Pat", "set": {"pattern": {"count1": "5"}}}));
+    assert_eq!(names(&s), ["X", "Second", "X (3)", "X (4)", "X (5)"]);
+    run(&mut s, "edit.undo", json!({}));
+    assert_eq!(names(&s), ["X", "Second", "X (3)"]);
+    run(&mut s, "edit.redo", json!({}));
+    assert_eq!(names(&s), ["X", "Second", "X (3)", "X (4)", "X (5)"]);
+    let reopened = Session::new(solidcraft_doc::Document::from_json(&s.doc.to_json()).unwrap());
+    assert_eq!(names(&reopened), ["X", "Second", "X (3)", "X (4)", "X (5)"]);
+    run(&mut s, "timeline.edit", json!({"feature": "Pat", "set": {"pattern": {"count1": "2"}}}));
+    assert_eq!(names(&s), ["X", "Second"]);
+}
+
+/// What a body of the #12114 tests is and where: the box is 10 mm across, the post 6 mm; and its
+/// centre in x.
+fn pattern_box_or_post(s: &mut Session, body: &str) -> (&'static str, f64) {
+    let m = run(s, "inspect.measure", json!({"bodies": [body]}));
+    let bbox = &m["bodies"][0]["bbox"];
+    let (min, max) = (bbox["min"][0].as_f64().unwrap_or(f64::NAN), bbox["max"][0].as_f64().unwrap_or(f64::NAN));
+    (if max - min > 8.0 { "box" } else { "post" }, ((min + max) / 2.0).round())
+}
+
+/// A pattern of two bodies keeps each copy's name with its own source and place when the count
+/// goes up or down, through undo, reopening and a change to the bodies it copies (#12114).
+#[test]
+fn pattern_copies_of_several_bodies_keep_their_names_when_the_count_changes() {
+    let mut s = Session::default();
+    let names = |s: &Session| -> Vec<String> { s.model.state().bodies.iter().map(|b| b.name.clone()).collect() };
+    let shape = pattern_box_or_post;
+    run(&mut s, "parameters.add", json!({"name": "n", "expression": "2", "unit": ""}));
+    run(&mut s, "solid.box", json!({"length": 10, "width": 10, "height": 10, "center": [0, 0, 5], "operation": "new_body", "body_name": "Base"}));
+    run(&mut s, "solid.cylinder", json!({"diameter": 6, "height": 20, "base": [0, 0, 10], "operation": "new_body", "body_name": "Post"}));
+    run(&mut s, "solid.pattern.rectangular", json!({"bodies": ["Base", "Post"], "dir1": [1, 0, 0], "count1": "n", "spacing1": 30, "name": "Pat"}));
+    run(&mut s, "body.rename", json!({"body": "Post (2)", "name": "Lens"}));
+    assert_eq!(names(&s), ["Base", "Post", "Base (2)", "Lens"]);
+
+    run(&mut s, "parameters.change", json!({"name": "n", "expression": "4"}));
+    // The new post copies are numbered as a single body's are (#372); what matters here is that
+    // every name stays with its own source and place.
+    assert_eq!(names(&s), ["Base", "Post", "Base (2)", "Base (3)", "Base (4)", "Lens", "Post (2)", "Post (3)"]);
+    let expect = [("Base (2)", ("box", 30.0)), ("Base (4)", ("box", 90.0)), ("Lens", ("post", 30.0)), ("Post (3)", ("post", 90.0))];
+    for (body, want) in expect {
+        assert_eq!(shape(&mut s, body), want, "{body}");
+    }
+
+    run(&mut s, "parameters.change", json!({"name": "n", "expression": "3"}));
+    assert_eq!(names(&s), ["Base", "Post", "Base (2)", "Base (3)", "Lens", "Post (2)"]);
+    assert_eq!(shape(&mut s, "Lens"), ("post", 30.0));
+    run(&mut s, "edit.undo", json!({}));
+    assert_eq!(names(&s), ["Base", "Post", "Base (2)", "Base (3)", "Base (4)", "Lens", "Post (2)", "Post (3)"]);
+    run(&mut s, "edit.redo", json!({}));
+    let reopened = Session::new(solidcraft_doc::Document::from_json(&s.doc.to_json()).unwrap());
+    assert_eq!(names(&reopened), ["Base", "Post", "Base (2)", "Base (3)", "Lens", "Post (2)"]);
+
+    // Copying only the post now: the post's copies keep their names.
+    run(&mut s, "timeline.edit", json!({"feature": "Pat", "set": {"bodies": ["Post"]}}));
+    assert_eq!(names(&s), ["Base", "Post", "Lens", "Post (2)"]);
+    assert_eq!(shape(&mut s, "Lens"), ("post", 30.0));
+    assert_eq!(shape(&mut s, "Post (2)"), ("post", 60.0));
+}
+
+/// A design saved before #12114 whose two-body Pattern went from count 4 to 3 kept all six names
+/// and read them in the order its copies were made, so the post at x = 30 was `Base (4)`. It
+/// opens with the names it was saved with, and from then on a count change keeps each name with
+/// its copy.
+#[test]
+fn an_older_pattern_of_several_bodies_opens_with_the_names_it_was_saved_with() {
+    let mut s = Session::default();
+    let names = |s: &Session| -> Vec<String> { s.model.state().bodies.iter().map(|b| b.name.clone()).collect() };
+    let shape = pattern_box_or_post;
+    run(&mut s, "parameters.add", json!({"name": "n", "expression": "3", "unit": ""}));
+    run(&mut s, "solid.box", json!({"length": 10, "width": 10, "height": 10, "center": [0, 0, 5], "operation": "new_body", "body_name": "Base"}));
+    run(&mut s, "solid.cylinder", json!({"diameter": 6, "height": 20, "base": [0, 0, 10], "operation": "new_body", "body_name": "Post"}));
+    run(&mut s, "solid.pattern.rectangular", json!({"bodies": ["Base", "Post"], "dir1": [1, 0, 0], "count1": "n", "spacing1": 30, "name": "Pat"}));
+    // The file as an older build saved it: without this change, and with the names it stored.
+    let mut file: serde_json::Value = serde_json::from_str(&s.doc.to_json()).unwrap();
+    if let Some(pending) = file["format_pending"].as_array_mut() {
+        pending.retain(|change| change != "pattern-names-by-source");
+    }
+    // 0.42.0 folded the change into format 56, so a build before it wrote 55.
+    file["format"] = serde_json::Value::String(solidcraft_doc::format::format_string(55));
+    file.as_object_mut().unwrap().remove("format_pending");
+    let pattern = file["features"].as_array_mut().unwrap().iter_mut().find(|f| f["name"] == "Pat").unwrap();
+    pattern["body_names"] = json!(["Base (2)", "Base (3)", "Base (4)", "Post (2)", "Post (3)", "Post (4)"]);
+    let doc = solidcraft_doc::Document::from_json(&file.to_string()).unwrap();
+    assert!(doc.features.iter().any(|f| f.name == "Pat" && f.pattern_names_in_order));
+
+    let mut s = Session::opened_at(doc, None, None);
+    assert_eq!(names(&s), ["Base", "Post", "Base (2)", "Base (3)", "Base (4)", "Post (2)"]);
+    assert_eq!(shape(&mut s, "Base (4)"), ("post", 30.0));
+    assert_eq!(shape(&mut s, "Post (2)"), ("post", 60.0));
+    // Opening stored the names as the copies have them, to be read source by source.
+    let pattern = s.doc.features.iter().find(|f| f.name == "Pat").unwrap();
+    assert!(!pattern.pattern_names_in_order);
+    assert_eq!(pattern.body_names, ["Base (2)", "Base (3)", "Base (4)", "Post (2)"]);
+
+    run(&mut s, "parameters.change", json!({"name": "n", "expression": "4"}));
+    assert_eq!(shape(&mut s, "Base (3)"), ("box", 60.0));
+    assert_eq!(shape(&mut s, "Base (4)"), ("post", 30.0));
+    assert_eq!(shape(&mut s, "Post (2)"), ("post", 60.0));
+    assert_eq!(names(&s).len(), 8);
+    run(&mut s, "parameters.change", json!({"name": "n", "expression": "2"}));
+    assert_eq!(names(&s), ["Base", "Post", "Base (2)", "Base (4)"]);
+    assert_eq!(shape(&mut s, "Base (4)"), ("post", 30.0));
+}
+
+/// A design made in memory whose two-body Pattern stored only some of its copies' names: the
+/// first command changes the bodies it copies, before any command stored the names. The copies
+/// it still makes keep their own names, not the names of the source it no longer copies (#12114).
+#[test]
+fn a_pattern_edited_before_its_names_were_stored_keeps_each_name_with_its_source() {
+    let mut s = Session::default();
+    let names = |s: &Session| -> Vec<String> { s.model.state().bodies.iter().map(|b| b.name.clone()).collect() };
+    let shape = pattern_box_or_post;
+    run(&mut s, "solid.box", json!({"length": 10, "width": 10, "height": 10, "center": [0, 0, 5], "operation": "new_body", "body_name": "Base"}));
+    run(&mut s, "solid.cylinder", json!({"diameter": 6, "height": 20, "base": [0, 0, 10], "operation": "new_body", "body_name": "Post"}));
+    run(&mut s, "solid.pattern.rectangular", json!({"bodies": ["Base", "Post"], "dir1": [1, 0, 0], "count1": 3, "spacing1": 30, "name": "Pat"}));
+    let mut doc = (*s.doc).clone();
+    if let Some(f) = doc.features.iter_mut().find(|f| f.name == "Pat") {
+        f.body_names = ["Base (2)", "Base (3)", "Lens"].map(String::from).to_vec();
+    }
+    let mut s = Session::new(doc);
+    assert_eq!(names(&s), ["Base", "Post", "Base (2)", "Base (3)", "Lens", "Post (2)"]);
+
+    run(&mut s, "timeline.edit", json!({"feature": "Pat", "set": {"bodies": ["Post"]}}));
+    assert_eq!(names(&s), ["Base", "Post", "Lens", "Post (2)"]);
+    assert_eq!(shape(&mut s, "Lens"), ("post", 30.0));
+    assert_eq!(shape(&mut s, "Post (2)"), ("post", 60.0));
+}
+
+/// Names an edit gives a Pattern of two bodies name its copies in the order they are made, as
+/// before #12114: a shorter list names the first copies, and the names stay through the store
+/// that follows the edit and through reopening.
+#[test]
+fn names_an_edit_gives_a_pattern_of_two_bodies_name_its_copies_in_order() {
+    let mut s = Session::default();
+    let names = |s: &Session| -> Vec<String> { s.model.state().bodies.iter().map(|b| b.name.clone()).collect() };
+    let shape = pattern_box_or_post;
+    run(&mut s, "solid.box", json!({"length": 10, "width": 10, "height": 10, "center": [0, 0, 5], "operation": "new_body", "body_name": "Base"}));
+    run(&mut s, "solid.cylinder", json!({"diameter": 6, "height": 20, "base": [0, 0, 10], "operation": "new_body", "body_name": "Post"}));
+    run(&mut s, "solid.pattern.rectangular", json!({"bodies": ["Base", "Post"], "dir1": [1, 0, 0], "count1": 3, "spacing1": 30, "name": "Pat"}));
+
+    run(&mut s, "timeline.edit", json!({"feature": "Pat", "set": {"body_names": ["Custom"]}}));
+    assert_eq!(shape(&mut s, "Custom"), ("box", 30.0), "{:?}", names(&s));
+
+    run(&mut s, "timeline.edit", json!({"feature": "Pat", "set": {"body_names": ["Left", "Right"]}}));
+    assert_eq!(shape(&mut s, "Left"), ("box", 30.0), "{:?}", names(&s));
+    assert_eq!(shape(&mut s, "Right"), ("box", 60.0), "{:?}", names(&s));
+    let reopened = Session::new(solidcraft_doc::Document::from_json(&s.doc.to_json()).unwrap());
+    assert_eq!(names(&reopened), names(&s));
+
+    // Names given with a change to the bodies are the new copies' names, in order, even when one
+    // source is left: they are not moved by source as the stored names are.
+    run(&mut s, "timeline.edit", json!({"feature": "Pat", "set": {"bodies": ["Post"], "body_names": ["Left", "Right"]}}));
+    assert_eq!(shape(&mut s, "Left"), ("post", 30.0), "{:?}", names(&s));
+    assert_eq!(shape(&mut s, "Right"), ("post", 60.0), "{:?}", names(&s));
+
+    // Names given that are the very names stored are still given: read in order, not moved.
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 10, "width": 10, "height": 10, "center": [0, 0, 5], "operation": "new_body", "body_name": "Base"}));
+    run(&mut s, "solid.cylinder", json!({"diameter": 6, "height": 20, "base": [0, 0, 10], "operation": "new_body", "body_name": "Post"}));
+    run(&mut s, "solid.pattern.rectangular", json!({"bodies": ["Base", "Post"], "dir1": [1, 0, 0], "count1": 2, "spacing1": 30, "name": "Pat"}));
+    run(&mut s, "timeline.edit", json!({"feature": "Pat", "set": {"body_names": ["Left", "Right"]}}));
+    assert_eq!(s.doc.find_feature("Pat").map(|f| f.body_names.clone()), Some(vec!["Left".to_string(), "Right".to_string()]));
+    run(&mut s, "timeline.edit", json!({"feature": "Pat", "set": {"bodies": ["Post"], "body_names": ["Left", "Right"]}}));
+    assert_eq!(shape(&mut s, "Left"), ("post", 30.0), "{:?}", names(&s));
+}
+
+/// A sketch side drawn as two collinear lines extrudes into one flat face, not two with an edge
+/// between them (#1788); the face is named from the first line and answers to the second.
+#[test]
+fn a_side_drawn_in_two_collinear_pieces_extrudes_into_one_face() {
+    let mut s = Session::default();
+    run(&mut s, "sketch.create", json!({"plane": "XY"}));
+    let r = run(&mut s, "sketch.line", json!({"points": [[0, 0], [10, 0], [20, 0], [20, 10], [0, 10], [0, 0]]}));
+    let pieces: Vec<String> = r["created"]["curves"].as_array().into_iter().flatten().take(2).filter_map(|c| c.as_str().map(String::from)).collect();
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "solid.extrude", json!({"distance": 5}));
+    let faces = |s: &mut Session| run(s, "model.faces", json!({"body": "Body1"}))["faces"].as_array().cloned().unwrap_or_default();
+    let f = faces(&mut s);
+    assert_eq!(f.len(), 6, "a box has six faces: {f:?}");
+    assert_eq!(run(&mut s, "inspect.measure", json!({}))["bodies"][0]["kernel"]["faces"], 6);
+    let names: Vec<&str> = f.iter().filter_map(|x| x["name"].as_str()).collect();
+    assert!(names.contains(&format!("F2:side:{}", pieces[0]).as_str()), "{names:?}");
+    // The extrude made the side from both pieces: the second piece's role names that very face
+    // too, so an edge named after it is that edge.
+    let st = s.model.state();
+    let body = st.body("Body1").unwrap();
+    let edge = format!("F2:side:{}|F2:top", pieces[1]);
+    let at = solidcraft_doc::naming::find_edge(body, &edge, solidcore_record::Vec3::new(15.0, 0.0, 5.0)).unwrap();
+    assert!(at.y.abs() < 1e-9 && (at.z - 5.0).abs() < 1e-9, "{edge} at {at:?}");
+    // A sketch attaches to the joined side as to any side.
+    assert_eq!(run(&mut s, "sketch.create", json!({"plane": {"face": [15, 0, 2.5]}}))["attachment"], "exact_face");
+    run(&mut s, "sketch.finish", json!({}));
+}
+
+/// A sketch made on the second piece's face while the side was two faces (as in a design saved
+/// before #1788) stays attached once the side is straight and extrudes into one face.
+#[test]
+fn a_sketch_on_one_piece_stays_attached_when_the_side_joins() {
+    let mut s = Session::default();
+    run(&mut s, "sketch.create", json!({"plane": "XY"}));
+    let r = run(&mut s, "sketch.line", json!({"points": [[0, 0], [10, -2], [20, 0], [20, 10], [0, 10], [0, 0]]}));
+    let first = r["created"]["curves"][0].as_str().unwrap_or_default().to_string();
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "solid.extrude", json!({"distance": 5}));
+    let faces = |s: &mut Session| run(s, "model.faces", json!({"body": "Body1"}))["faces"].as_array().map(Vec::len).unwrap_or(0);
+    assert_eq!(faces(&mut s), 7);
+    assert_eq!(run(&mut s, "sketch.create", json!({"plane": {"face": [15, -1, 2.5]}}))["attachment"], "exact_face");
+    run(&mut s, "sketch.circle.center", json!({"center": [5, 2.5], "radius": 1}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "sketch.edit", json!({"sketch": "Sketch1"}));
+    run(&mut s, "sketch.move_point", json!({"point": format!("{first}.end"), "to": [10, 0]}));
+    run(&mut s, "sketch.finish", json!({}));
+    assert_eq!(faces(&mut s), 6, "the side is straight now: one face");
+    let sketch = run(&mut s, "timeline.inspect", json!({"feature": "Sketch2"}));
+    assert!(sketch["error"].is_null() && sketch["warning"].is_null(), "{sketch}");
+}
+
+/// With a taper too, a side drawn in two collinear pieces extrudes into one face (#1788).
+#[test]
+fn a_tapered_side_drawn_in_two_collinear_pieces_is_one_face() {
+    let mut s = Session::default();
+    run(&mut s, "sketch.create", json!({"plane": "XY"}));
+    run(&mut s, "sketch.line", json!({"points": [[0, 0], [10, 0], [20, 0], [20, 10], [0, 10], [0, 0]]}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "solid.extrude", json!({"distance": 5, "taper": "5 deg"}));
+    let m = run(&mut s, "inspect.measure", json!({}));
+    assert_eq!(m["bodies"][0]["kernel"]["faces"], 6, "{m}");
+}
+
+/// #3044: renaming a body of an imported assembly (a part placed twice, so the file has more
+/// solids than the part has bodies) evaluates nothing, not even the file again, and leaves the
+/// model evaluating the renamed design gives; undo does the same.
+#[test]
+fn renaming_an_imported_assembly_body_reads_nothing_again() {
+    let dir = std::env::temp_dir().join(format!("solidcraft-step-rename-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut a = Session::default();
+    run(&mut a, "solid.box", json!({"length": 10, "width": 10, "height": 10, "body_name": "Cube"}));
+    run(&mut a, "solid.box", json!({"length": 4, "width": 4, "height": 4, "center": [30, 0, 2], "operation": "new", "body_name": "Pin"}));
+    run(&mut a, "component.from_bodies", json!({"bodies": ["Cube"]}));
+    run(&mut a, "occurrence.copy", json!({"component": "Cube", "translate": [0, 40, 0]}));
+    let p = dir.join("Assembly.step");
+    run(&mut a, "file.export", json!({"path": p.to_string_lossy()}));
+    let mut s = Session::default();
+    run(&mut s, "doc.open", json!({"path": p.to_string_lossy()}));
+    let names = |s: &Session| s.model.state().bodies.iter().map(|b| b.name.clone()).collect::<Vec<_>>();
+    let before = names(&s);
+    let body = before.first().cloned().unwrap();
+    s.evaluations = 0;
+    run(&mut s, "body.rename", json!({"body": body, "name": "Renamed"}));
+    assert_eq!(s.evaluations, 0, "a rename evaluates nothing");
+    let after = names(&s);
+    assert_eq!(after.first().map(String::as_str), Some("Renamed"));
+    assert_eq!(after.len(), before.len());
+    let mut fresh = Session::new((*s.doc).clone());
+    fresh.refresh();
+    assert_eq!(names(&fresh), after, "the same names as evaluating the renamed design");
+    run(&mut s, "edit.undo", json!({}));
+    assert_eq!(names(&s), before);
+    assert_eq!(s.evaluations, 0, "nor does its undo");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Renaming one of an imported file's solids whose siblings are numbered after it (`Bolt` beside
+/// `Bolt (2)`, as the solids of a STEP file with one label are built) evaluates nothing either: the
+/// rename keeps the siblings' names, so the model is the one evaluating the renamed design gives.
+#[test]
+fn renaming_an_imported_body_with_numbered_siblings_evaluates_nothing() {
+    let dir = std::env::temp_dir().join(format!("solidcraft-step-rename-siblings-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut a = Session::default();
+    run(&mut a, "solid.box", json!({"length": 10, "width": 10, "height": 10, "body_name": "Bolt"}));
+    run(&mut a, "solid.box", json!({"length": 4, "width": 4, "height": 4, "center": [30, 0, 2], "operation": "new", "body_name": "Bolt (2)"}));
+    let p = dir.join("Bolts.step");
+    run(&mut a, "file.export", json!({"path": p.to_string_lossy()}));
+    let mut s = Session::default();
+    run(&mut s, "doc.open", json!({"path": p.to_string_lossy()}));
+    let names = |s: &Session| s.model.state().bodies.iter().map(|b| b.name.clone()).collect::<Vec<_>>();
+    let before = names(&s);
+    let first = before.iter().find(|n| !n.ends_with(" (2)")).cloned().unwrap();
+    assert!(before.contains(&format!("{first} (2)")), "a sibling numbered after it: {before:?}");
+    s.evaluations = 0;
+    run(&mut s, "body.rename", json!({"body": first, "name": "Renamed"}));
+    assert_eq!(s.evaluations, 0, "a rename evaluates nothing");
+    let after = names(&s);
+    assert!(after.contains(&"Renamed".to_string()) && after.contains(&format!("{first} (2)")), "{after:?}");
+    let mut fresh = Session::new((*s.doc).clone());
+    fresh.refresh();
+    assert_eq!(names(&fresh), after, "the same names as evaluating the renamed design");
+    run(&mut s, "edit.undo", json!({}));
+    assert_eq!(names(&s), before);
+    run(&mut s, "edit.redo", json!({}));
+    assert_eq!(names(&s), after);
+    assert_eq!(s.evaluations, 0, "nor do its undo and redo");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// #2467: renaming a body that later features change (a hole patterned over it, then a chamfer)
+/// evaluates nothing, and leaves the bodies, volumes and face names evaluating the renamed
+/// design gives; undo and redo do the same.
+#[test]
+fn renaming_a_body_later_features_change_evaluates_nothing() {
+    let mut s = Session::default();
+    run(&mut s, "sketch.create", json!({"plane": "XY"}));
+    run(&mut s, "sketch.rectangle.two_point", json!({"p0": [0, 0], "p1": [80, 50]}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "solid.extrude", json!({"distance": 10}));
+    run(
+        &mut s,
+        "solid.hole",
+        json!({"position": [15, 12, 10], "diameter": 5, "type": "counterbore", "cb_diameter": 9, "cb_depth": 3, "name": "Hole1"}),
+    );
+    run(
+        &mut s,
+        "solid.pattern.rectangular",
+        json!({"features": ["Hole1"], "dir1": [1, 0, 0], "count1": 3, "spacing1": 25, "dir2": [0, 1, 0], "count2": 2, "spacing2": 25}),
+    );
+    run(&mut s, "solid.chamfer", json!({"edges": [[40, 0, 10], [80, 25, 10]], "distance": 1}));
+    let looks = |st: &solidcraft_doc::ModelState| {
+        st.bodies.iter().map(|b| (b.name.clone(), (*solidcraft_doc::naming::face_names(b)).clone())).collect::<Vec<_>>()
+    };
+    let before = looks(&s.model.state());
+    let v = body_volume(&s.model.state());
+    let old = before.first().map(|b| b.0.clone()).unwrap();
+    s.evaluations = 0;
+    run(&mut s, "body.rename", json!({"body": old, "name": "Plate"}));
+    assert_eq!(s.evaluations, 0, "a rename evaluates nothing");
+    let after = looks(&s.model.state());
+    assert_eq!(after.first().map(|b| b.0.as_str()), Some("Plate"));
+    let mut fresh = Session::new((*s.doc).clone());
+    fresh.refresh();
+    assert_eq!(looks(&fresh.model.state()), after, "the bodies and face names evaluating the renamed design gives");
+    assert!(rel(body_volume(&fresh.model.state()), v) < 1e-9);
+    run(&mut s, "edit.undo", json!({}));
+    assert_eq!(looks(&s.model.state()), before);
+    run(&mut s, "edit.redo", json!({}));
+    assert_eq!(looks(&s.model.state()), after);
+    assert_eq!(s.evaluations, 0, "nor do its undo and redo");
+}
+
+/// #12657: renaming a body that a split cut in two, after many features changed it, evaluates
+/// nothing: the split's other piece (`Caisson (1)`) keeps its name, which the split stores, so
+/// the model is the one evaluating the renamed design gives. Undo and redo do the same.
+#[test]
+fn renaming_a_split_body_evaluates_nothing() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 300, "width": 200, "height": 160, "center": [0, 0, 80], "body_name": "Caisson"}));
+    run(&mut s, "solid.shell", json!({"faces": [[0, 0, 160]], "thickness": 4, "body": "Caisson"}));
+    for i in 0..3 {
+        let base = [-140 + i * 14, -103, 20];
+        run(
+            &mut s,
+            "solid.cylinder",
+            json!({"diameter": 4.5, "height": 10, "base": base, "axis": [0, 1, 0], "operation": "cut", "targets": ["Caisson"]}),
+        );
+    }
+    run(&mut s, "solid.split_body", json!({"body": "Caisson", "plane": {"origin": [0, 0, 80], "normal": [0, 0, 1]}}));
+    let looks = |st: &solidcraft_doc::ModelState| {
+        st.bodies.iter().map(|b| (b.name.clone(), (*solidcraft_doc::naming::face_names(b)).clone())).collect::<Vec<_>>()
+    };
+    let before = looks(&s.model.state());
+    assert!(before.iter().any(|b| b.0 == "Caisson (1)"), "{:?}", before.iter().map(|b| &b.0).collect::<Vec<_>>());
+    let v = body_volume(&s.model.state());
+    s.evaluations = 0;
+    run(&mut s, "body.rename", json!({"body": "Caisson", "name": "Haut"}));
+    assert_eq!(s.evaluations, 0, "a rename evaluates nothing");
+    let after = looks(&s.model.state());
+    assert!(
+        after.iter().any(|b| b.0 == "Haut") && after.iter().any(|b| b.0 == "Caisson (1)"),
+        "{:?}",
+        after.iter().map(|b| &b.0).collect::<Vec<_>>()
+    );
+    let mut fresh = Session::new((*s.doc).clone());
+    fresh.refresh();
+    assert_eq!(looks(&fresh.model.state()), after, "the bodies and face names evaluating the renamed design gives");
+    assert!(rel(body_volume(&fresh.model.state()), v) < 1e-9);
+    run(&mut s, "edit.undo", json!({}));
+    assert_eq!(looks(&s.model.state()), before);
+    run(&mut s, "edit.redo", json!({}));
+    assert_eq!(looks(&s.model.state()), after);
+    assert_eq!(s.evaluations, 0, "nor do its undo and redo");
+}
+
+/// A body whose name later bodies' names are worked out from (`X` patterned into `X (2)`) keeps
+/// the same copies and face names as opening the renamed design.
+#[test]
+fn renaming_a_body_keeps_its_copies_consistent_with_rebuilding() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 10, "width": 10, "height": 10, "body_name": "X"}));
+    run(&mut s, "solid.pattern.rectangular", json!({"bodies": ["X"], "dir1": [1, 0, 0], "count1": 3, "spacing1": 20}));
+    let names = |s: &Session| s.model.state().bodies.iter().map(|b| b.name.clone()).collect::<Vec<_>>();
+    assert!(names(&s).iter().any(|n| n.starts_with("X (")), "{:?}", names(&s));
+    run(&mut s, "body.rename", json!({"body": "X", "name": "First"}));
+    let mut fresh = Session::new((*s.doc).clone());
+    fresh.refresh();
+    assert_eq!(names(&fresh), names(&s));
+    for (a, b) in fresh.model.state().bodies.iter().zip(&s.model.state().bodies) {
+        assert_eq!(solidcraft_doc::naming::face_names(a), solidcraft_doc::naming::face_names(b));
+    }
+}
+
+/// #3044: on a design with thousands of bodies the cheap commands stay cheap: showing, hiding,
+/// selecting, colouring and renaming a body or a feature, and undoing them, recompute no feature
+/// (renames don't even look over the timeline) and leave every body's display mesh as it was, so
+/// nothing is meshed or uploaded again.
+#[test]
+fn cheap_commands_on_thousands_of_bodies_evaluate_nothing() {
+    let mut s = Session::default();
+    for k in 0..2 {
+        run(
+            &mut s,
+            "solid.box",
+            json!({"length": 4, "width": 4, "height": 4, "center": [0, 6 * k, 2], "operation": "new", "name": format!("Seed{k}")}),
+        );
+        run(
+            &mut s,
+            "solid.pattern.rectangular",
+            json!({"features": [format!("Seed{k}")], "dir1": [1, 0, 0], "count1": 1000, "spacing1": 6, "name": format!("Row{k}")}),
+        );
+    }
+    let st = s.model.state();
+    assert_eq!(st.bodies.len(), 2000);
+    let meshes = |s: &Session| s.model.state().bodies.iter().map(|b| std::sync::Arc::as_ptr(&b.mesh())).collect::<Vec<_>>();
+    let shown = meshes(&s);
+    s.refresh();
+    for (command, params) in [
+        ("select.set", json!({"items": [{"type": "body", "name": "Body7"}]})),
+        ("browser.visibility", json!({"visible": false, "items": ["Body7"]})),
+        ("browser.visibility", json!({"visible": true, "items": ["Body7"]})),
+        ("appearance.assign", json!({"bodies": ["Body7"], "appearance": "Aluminum - Satin"})),
+        ("body.rename", json!({"body": "Body7", "name": "Renamed"})),
+        ("timeline.rename", json!({"feature": "Row1", "name": "Second row"})),
+        ("edit.undo", json!({})),
+        ("edit.undo", json!({})),
+        ("edit.redo", json!({})),
+    ] {
+        s.evaluations = 0;
+        run(&mut s, command, params);
+        // Renames are followed in the model; the rest may look over the timeline, which then
+        // finds every result as it was.
+        assert_eq!(s.model.last_recomputed, 0, "{command} recomputed a feature");
+        if command.ends_with("rename") {
+            assert_eq!(s.evaluations, 0, "{command} evaluated the design");
+        }
+    }
+    assert_eq!(meshes(&s), shown, "every body keeps its mesh");
+}
+
+/// #3397: a new, empty component changes nothing a feature reads, so creating one recomputes
+/// nothing, the first component of a design included: not a targeted cut, a Combine, a To
+/// Object extrude or a sketch on a face without a construction certificate (a legacy face
+/// plane, which reads every placed body), all of which read placements.
+#[test]
+fn creating_a_component_recomputes_nothing() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 30, "width": 30, "height": 10, "operation": "new", "body_name": "Block"}));
+    run(&mut s, "solid.cylinder", json!({"diameter": 8, "height": 12, "base": [15, 15, -1], "operation": "cut", "targets": ["Block"]}));
+    run(&mut s, "solid.box", json!({"length": 10, "width": 30, "height": 20, "corner": [0, 0, 10], "operation": "new", "body_name": "Tab"}));
+    run(&mut s, "solid.combine", json!({"target": "Block", "tools": ["Tab"], "operation": "join"}));
+    run(&mut s, "sketch.create", json!({"plane": "XY", "name": "Post sketch"}));
+    run(&mut s, "sketch.circle.center", json!({"center": [25, 25], "radius": 2}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "solid.extrude", json!({"sketch": "Post sketch", "to": [25, 25, 10], "operation": "new", "body_name": "Post"}));
+    // A sketch on a face without a construction certificate: a face extrude on a plate, saved
+    // as a design from before face attachments were certified (no anchor), and reopened.
+    run(&mut s, "solid.box", json!({"length": 100, "width": 100, "height": 10, "corner": [200, 0, 0], "operation": "new", "body_name": "Plate"}));
+    run(&mut s, "solid.extrude", json!({"face": [240, 40, 10], "distance": 1, "operation": "join", "name": "Face layer"}));
+    let mut legacy = (*s.doc).clone();
+    let mut legacy_face = false;
+    for f in &mut legacy.features {
+        if let solidcraft_doc::FeatureKind::Sketch { plane: solidcraft_doc::PlaneRef::Face { anchor, .. }, .. } = &mut f.kind {
+            *anchor = None;
+            legacy_face = true;
+        }
+    }
+    assert!(legacy_face, "the face extrude's sketch is on a face plane");
+    let mut s = Session::new(solidcraft_doc::Document::from_json(&legacy.to_json()).unwrap());
+    assert!(s.model.results.iter().all(|r| r.error.is_none()), "the legacy design evaluates");
+    for name in ["First", "Second"] {
+        run(&mut s, "component.create", json!({"name": name}));
+        assert_eq!(s.model.last_recomputed, 0, "creating {name} recomputed a feature");
+        run(&mut s, "component.activate", json!({"component": "root"}));
+    }
+}
+
+#[test]
+fn parallel_pipe_large_nominals_support_shallow_and_thin_cylindrical_holes() {
+    for designation in ["G 1", "Rp 1"] {
+        for (height, depth) in [(15.0, Some(3.0)), (5.0, None)] {
+            let mut s = crate::Session::default();
+            s.execute("solid.box", &format!(r#"{{"length":80,"width":80,"height":{height},"body_name":"Plate"}}"#).parse().unwrap()).unwrap();
+            let depth_json = depth.map(|d| format!(r#", "depth":{d}"#)).unwrap_or_default();
+            let result =
+                s.execute("solid.hole", &format!(r#"{{"position":[40,40,{height}],"thread":"{designation}"{depth_json}}}"#).parse().unwrap());
+            assert!(result.is_ok(), "{designation}, height={height}, depth={depth:?}: {result:?}");
+            let reopened = crate::Session::new(crate::doc::Document::from_json(&s.doc.to_json()).unwrap());
+            assert!(reopened.model.results.iter().all(|r| r.error.is_none()));
+            let state = reopened.world_state().unwrap();
+            assert_eq!(state.threads.len(), 1);
+            assert_eq!(state.threads[0].designation, designation);
+            assert!((state.threads[0].end - state.threads[0].start - depth.unwrap_or(height)).abs() < 1e-6);
+        }
+    }
+}
+
+/// #3961: a cut made while a body is hidden leaves that body alone, and keeps doing so once it
+/// is shown again (the shown bodies are stored as the cut's targets); with nothing hidden, a
+/// cut still goes through every body it meets.
+#[test]
+fn a_cut_leaves_hidden_bodies_alone() {
+    let setup = |hide: bool| {
+        let mut s = Session::default();
+        run(&mut s, "solid.box", json!({"length": 20, "width": 20, "height": 10, "body_name": "Below"}));
+        run(&mut s, "solid.box", json!({"length": 20, "width": 20, "height": 10, "corner": [0, 0, 10], "body_name": "Above", "operation": "new"}));
+        if hide {
+            run(&mut s, "browser.visibility", json!({"items": ["Below"], "visible": false}));
+        }
+        run(&mut s, "sketch.create", json!({"plane": {"face": [10, 10, 20]}}));
+        run(&mut s, "sketch.circle.center", json!({"center": [10, 10], "radius": 3}));
+        run(&mut s, "sketch.finish", json!({}));
+        run(&mut s, "solid.extrude", json!({"distance": 30, "direction": "negative", "operation": "cut"}));
+        s
+    };
+    let vol = |s: &Session, name: &str| solidcraft_kernel::measure(&s.world_state().unwrap().body(name).unwrap().body).unwrap().volume;
+    let full = 20.0 * 20.0 * 10.0;
+    let mut hidden = setup(true);
+    assert!((vol(&hidden, "Below") - full).abs() < 1e-6, "the hidden body is not cut");
+    assert!(vol(&hidden, "Above") < full - 1.0, "the shown one is");
+    run(&mut hidden, "browser.visibility", json!({"items": ["Below"], "visible": true}));
+    assert!((vol(&hidden, "Below") - full).abs() < 1e-6, "shown again, it stays as it was");
+    let shown = setup(false);
+    assert!(vol(&shown, "Below") < full - 1.0 && vol(&shown, "Above") < full - 1.0, "with nothing hidden, both are cut");
+}
+
+/// #2464: an extrude Join with no targets onto a plate with a hidden coincident copy changes the
+/// shown plate only, and keeps the shown bodies as its participants.
+#[test]
+fn join_leaves_a_hidden_body_alone() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 40, "width": 40, "height": 5, "body_name": "Plate"}));
+    run(&mut s, "solid.move", json!({"bodies": ["Plate"], "copy": true}));
+    run(&mut s, "browser.visibility", json!({"items": ["Plate (2)"], "visible": false}));
+    run(&mut s, "sketch.create", json!({"plane": "XY", "offset": 5, "name": "Rim"}));
+    run(&mut s, "sketch.rectangle.two_point", json!({"p0": [2, 2], "p1": [38, 38]}));
+    run(&mut s, "sketch.rectangle.two_point", json!({"p0": [4, 4], "p1": [36, 36]}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "solid.extrude", json!({"sketch": "Rim", "profiles": [{"point": [3, 3]}], "distance": 3, "operation": "join"}));
+    let st = s.model.state();
+    assert_eq!(st.bodies.len(), 2);
+    let v = |n: &str| solidcraft_kernel::measure(&st.body(n).unwrap().body).unwrap().volume;
+    assert!(rel(v("Plate"), 8816.0) < 1e-9 && rel(v("Plate (2)"), 8000.0) < 1e-9);
+    let f = s.doc.features.last().unwrap();
+    assert_eq!(f.participants, vec!["Plate".to_string()]);
+    // Showing the copy again doesn't change the model.
+    run(&mut s, "browser.visibility", json!({"items": ["Plate (2)"], "visible": true}));
+    assert_eq!(s.model.state().bodies.len(), 2);
+}
+
+/// A pre-command check that refuses one command id.
+fn refusing(id: &'static str) -> CommandCheck {
+    std::sync::Arc::new(move |cmd: &str, _: &Value, _: &Session| if cmd == id { Err(format!("{cmd} is not allowed here")) } else { Ok(()) })
+}
+
+#[test]
+fn without_a_command_check_every_command_runs() {
+    let mut s = Session::default();
+    assert!(s.command_check().is_none());
+    run(&mut s, "solid.box", json!({"length": 10, "width": 10, "height": 10}));
+    run(&mut s, "solid.box", json!({"length": 5, "width": 5, "height": 5, "corner": [20, 0, 0]}));
+    assert_eq!(s.doc.features.len(), 2);
+}
+
+#[test]
+fn a_command_check_refuses_a_command_and_leaves_the_design() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 10, "width": 10, "height": 10}));
+    s.set_command_check(Some(refusing("solid.box")));
+    let doc = s.doc.clone();
+    let (undo, revision) = (s.undo.len(), s.revision);
+    let r = s.execute("solid.box", &json!({"length": 5, "width": 5, "height": 5, "corner": [20, 0, 0]}));
+    match r {
+        Err(EngineError::Refused { cmd, reason }) => {
+            assert_eq!(cmd, "solid.box");
+            assert_eq!(reason, "solid.box is not allowed here");
+        }
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+    assert!(std::sync::Arc::ptr_eq(&doc, &s.doc), "the design is unchanged");
+    assert_eq!((s.undo.len(), s.revision), (undo, revision));
+    // Other commands still run, and the check stays with the session across new designs,
+    // scripts and previews.
+    run(&mut s, "file.new", json!({"name": "Next"}));
+    assert!(s.execute("solid.box", &json!({"length": 1, "width": 1, "height": 1})).is_err(), "kept by file.new");
+    assert!(s.run_script(&json!([{"command": "solid.box", "params": {"length": 1, "width": 1, "height": 1}}])).is_err(), "scripts");
+    assert!(s.preview(&[("solid.box".into(), json!({"length": 1, "width": 1, "height": 1}))]).is_err(), "previews");
+    s.set_command_check(None);
+    run(&mut s, "solid.box", json!({"length": 1, "width": 1, "height": 1}));
+}
+
+#[test]
+fn a_command_check_can_count_the_features() {
+    const MAX: usize = 3;
+    let mut s = Session::default();
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(String, Value)>::new()));
+    let log = seen.clone();
+    s.set_command_check(Some(std::sync::Arc::new(move |cmd: &str, params: &Value, s: &Session| {
+        if let Ok(mut log) = log.lock() {
+            log.push((cmd.to_string(), params.clone()));
+        }
+        if cmd.starts_with("solid.") && s.doc.features.len() >= MAX { Err(format!("at most {MAX} features")) } else { Ok(()) }
+    })));
+    for i in 0..MAX {
+        run(&mut s, "solid.box", json!({"length": 1, "width": 1, "height": 1, "corner": [i * 5, 0, 0]}));
+    }
+    let r = s.execute("solid.box", &json!({"length": 1, "width": 1, "height": 1, "corner": [50, 0, 0]}));
+    assert!(matches!(&r, Err(EngineError::Refused { .. })), "{r:?}");
+    assert_eq!(r.err().map(|e| e.to_string()).as_deref(), Some("at most 3 features"));
+    assert_eq!(s.doc.features.len(), MAX);
+    // The check saw each command's id and parameters.
+    let seen = seen.lock().map(|l| l.clone()).unwrap_or_default();
+    assert_eq!(seen.len(), MAX + 1);
+    assert!(seen.iter().all(|(id, p)| id == "solid.box" && p["length"] == 1));
+}
+
+#[test]
+fn a_command_check_that_panics_refuses_the_command() {
+    let mut s = Session::default();
+    s.set_command_check(Some(std::sync::Arc::new(|_: &str, _: &Value, _: &Session| -> std::result::Result<(), String> { panic!("host bug") })));
+    let r = s.execute("solid.box", &json!({"length": 1, "width": 1, "height": 1}));
+    assert!(matches!(r, Err(EngineError::Internal(..))), "{r:?}");
+    assert!(s.doc.features.is_empty());
+}
+
+/// #4153, #11901: the other ISO 261 metric sizes (M33, M39, M45, M3.5…) are known by name with
+/// their ISO 262 coarse pitch, as the first-choice ones are, and a thread named so is cut with
+/// it. The size chosen automatically for a face is still one of the first-choice sizes, as
+/// before they were added: a 33 mm shaft is sized M30 on main and here.
+#[test]
+fn second_choice_metric_threads_are_known_by_name() {
+    use solidcraft_doc::thread_forms::ThreadForm;
+    for (name, dia, pitch) in [("M3.5", 3.5, 0.6), ("M7", 7.0, 1.0), ("M33", 33.0, 3.5), ("M39", 39.0, 4.0), ("M45", 45.0, 4.5), ("M64", 64.0, 6.0)] {
+        assert_eq!(solidcraft_doc::parse_metric_thread(name), Some((dia, pitch)), "{name}");
+        assert_eq!(ThreadForm::Metric.format(dia, pitch, pitch), name);
+        let mut s = Session::default();
+        run(&mut s, "solid.cylinder", json!({"diameter": dia, "height": 4.0 * dia, "body_name": "Shaft"}));
+        let named = run(&mut s, "solid.thread", json!({"face": [dia / 2.0, 0.0, 2.0 * dia], "designation": name}));
+        assert!((named["thread"]["pitch"].as_f64().unwrap() - pitch).abs() < 1e-9, "{named}");
+    }
+    // The smallest second-choice size, by name only (no shaft that thin is cut here).
+    assert_eq!(solidcraft_doc::parse_metric_thread("M1.1"), Some((1.1, 0.25)));
+    assert_eq!(ThreadForm::Metric.format(1.1, 0.25, 0.25), "M1.1");
+    assert_eq!(ThreadForm::Metric.fit(33.0, false), Some((30.0, 3.5)));
+    assert_eq!(ThreadForm::Metric.fit(7.0, false), Some((6.0, 1.0)));
+    assert_ne!(ThreadForm::Metric.fit(39.0, true).map(|(d, _)| d), Some(39.0), "a 39 mm hole is not sized M39 automatically");
+}
+
+/// The ISO 273 table a dialog lists: every size `clearance` takes, M1.6 to M64, each with its
+/// three fits, and a size with its pitch finds the same row.
+#[test]
+fn clearance_sizes_are_the_iso_273_table() {
+    let sizes = cmd::clearance_sizes();
+    assert_eq!(sizes.len(), 21);
+    assert_eq!((sizes.first().map(String::as_str), sizes.last().map(String::as_str)), (Some("M1.6"), Some("M64")));
+    assert!(sizes.iter().any(|s| s == "M4") && sizes.iter().any(|s| s == "M2"), "{sizes:?}");
+    for size in &sizes {
+        for fit in ["close", "normal", "loose"] {
+            assert!(cmd::clearance_diameter(size, fit).is_some(), "{size} {fit}");
+        }
+    }
+    assert_eq!(cmd::clearance_diameter("M4", "normal"), Some(4.5));
+    assert_eq!(cmd::clearance_diameter("M4x0.7", "close"), Some(4.3));
+    assert_eq!(cmd::clearance_diameter("m4", "loose"), Some(4.8));
+    assert_eq!(cmd::clearance_diameter("M7", "normal"), None, "no M7 in ISO 273");
+    assert_eq!(cmd::clearance_diameter("M4", "snug"), None, "no such fit");
+}
+
+/// The counterbore `head` makes, as the Hole dialog shows it before running the command: the
+/// head's diameter and height from the standard's table plus the default 0.5 mm gap each side
+/// and below. A size with its pitch finds the same head; a size or standard the tables do not
+/// have gives none.
+#[test]
+fn head_counterbore_is_the_head_plus_the_default_gap() {
+    assert_eq!(cmd::head_counterbore("ISO 4762", "M4"), Some((8.0, 4.5)), "socket head dk 7, k 4");
+    assert_eq!(cmd::head_counterbore("ISO 7380-1", "M4x0.7"), Some((8.6, 2.7)), "button head dk 7.6, k 2.2");
+    assert_eq!(cmd::head_counterbore("socket_head_cap_screw", "M4"), Some((8.0, 4.5)), "the family name parts.insert takes");
+    assert_eq!(cmd::head_counterbore("ISO 7380-1", "M2"), None, "ISO 7380-1 has no M2");
+    assert_eq!(cmd::head_counterbore("DIN 912", "M4"), None);
+}
+
+/// Rounding the flat face of a half torus (Ø60 centre circle, Ø16 tube, cut at Z = 0) with 0.8 mm
+/// where a Ø1.9 notch is cut 4 mm into the outer rim, its side 0.00002 mm clear of the torus's
+/// seam: 0.43.0 failed with status 1001, "Fillet Surface Computation Failure" (#18565). The
+/// issue's two picks take the inner rim and the outer rim's arc (the notch's arc meets that at a
+/// corner, so it is not in its tangent chain); a third pick on the notch's arc rounds the whole
+/// outer loop. Each builds one valid solid with the corners of the picked edges rounded away and
+/// the volume of the half torus less the notch and the rounds (Pappus on the corner between the
+/// flat face and the tube; the notch's own round about 0.41 mm³ more).
+#[test]
+fn a_notched_half_torus_rounds_its_flat_face_loops() {
+    let (cx, cy): (f64, f64) = (37.9881251185, 0.949921038509);
+    // The notch's innermost point on the flat face, 0.95 in from the rim along its centre's ray.
+    let a = cy.atan2(cx);
+    let notch_in = cx.hypot(cy) - 0.95;
+    let at = |s: f64, a: f64, z: f64| solidcore_record::Vec3::new(s * a.cos(), s * a.sin(), z);
+    let rims = [[-20.6732376573, -7.52444315316, 0.0], [-35.7083195899, -12.9967654464, 0.0]];
+    let notch_arc = [notch_in * a.cos(), notch_in * a.sin(), 0.0];
+    for (with_notch, want) in [(false, 18885.45), (true, 18885.04)] {
+        let mut s = Session::default();
+        run(&mut s, "solid.torus", json!({"major": 30, "minor": 8, "operation": "new", "body_name": "Base"}));
+        let cut = json!({"length": 78, "width": 78, "height": 9, "corner": [-39, -39, -9], "operation": "cut", "targets": ["Base"]});
+        run(&mut s, "solid.box", cut);
+        run(&mut s, "sketch.create", json!({"plane": "XY", "name": "NotchSketch1"}));
+        run(&mut s, "sketch.circle.center", json!({"center": [cx, cy], "diameter": 1.9}));
+        run(&mut s, "sketch.finish", json!({}));
+        let notch = json!({"sketch": "NotchSketch1", "distance": 4, "direction": "positive", "operation": "cut", "targets": ["Base"]});
+        run(&mut s, "solid.extrude", notch);
+        let mut edges = rims.to_vec();
+        if with_notch {
+            edges.push(notch_arc);
+        }
+        run(&mut s, "solid.fillet", json!({"edges": edges, "radius": 0.8, "body": "Base"}));
+        let bodies = &s.model.state().bodies;
+        assert_eq!(bodies.len(), 1);
+        let body = &bodies[0].body;
+        let bad = body.validity();
+        assert!(bad.is_empty() && body.shell_count() == 1, "notch {with_notch}: {bad:?}, {} shells", body.shell_count());
+        let class = |p| body.classify_point(p).unwrap();
+        use solidcraft_kernel::PointClass::{Inside, Outside};
+        for (what, p) in [("inner rim", at(22.1, PI, 0.1)), ("outer rim", at(37.9, PI, 0.1))] {
+            assert_eq!(class(p), Outside, "notch {with_notch}: the {what}'s corner is rounded away");
+        }
+        let notch_corner = if with_notch { Outside } else { Inside };
+        assert_eq!(class(at(notch_in - 0.1, a, 0.1)), notch_corner, "notch {with_notch}: the notch's corner");
+        for (what, p) in [("the tube", at(30.0, PI, 4.0)), ("beside the notch's corner", at(notch_in - 0.6, a, 0.9))] {
+            assert_eq!(class(p), Inside, "notch {with_notch}: {what} is material");
+        }
+        let v = volume(&mut s);
+        assert!((v - want).abs() < 0.2, "notch {with_notch}: volume {v}, want {want}");
+    }
+}
