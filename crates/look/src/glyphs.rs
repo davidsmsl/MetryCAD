@@ -114,7 +114,7 @@ pub fn breadcrumb(p: &egui::Painter, c: egui::Pos2, col: Color32) {
     p.line_segment([pos2(c.x + 1.5, c.y), pos2(c.x - 1.5, c.y + 3.0)], s);
 }
 
-/// The SolidCraft mark in its colours, 20 points high, centred on `c` (the application bar).
+/// The MetryCAD mark in its colours, 20 points high, centred on `c` (the application bar).
 pub fn brand_mark(p: &egui::Painter, c: Pos2) {
     brand_mark_styled(p, c, 20.0, solidcraft_theme::Tokens::get().logo, true);
 }
@@ -125,50 +125,32 @@ pub fn brand_mark_silhouette(p: &egui::Painter, c: Pos2, height: f32, ink: Color
 }
 
 fn brand_mark_styled(p: &egui::Painter, c: Pos2, height: f32, colours: [Color32; 3], edges: bool) {
-    let s = height / 412.217;
-    let m = |pts: &[(f32, f32)]| -> Vec<egui::Pos2> { pts.iter().map(|&(x, y)| pos2(c.x + (x - 178.5) * s, c.y + (y - 206.1) * s)).collect() };
-    // egui only fills convex shapes, so each face is a few overlapping convex pieces.
+    // MetryCAD isotipo on a 100-unit grid: an isometric slab of terrain with two towers
+    // and an S-shaped road, in the theme's three logo colours.
+    let s = height / 100.0;
+    let m = |pts: &[(f32, f32)]| -> Vec<egui::Pos2> { pts.iter().map(|&(x, y)| pos2(c.x + (x - 50.0) * s, c.y + (y - 50.0) * s)).collect() };
     let face = |col: Color32, pts: &[(f32, f32)]| {
         p.add(egui::Shape::convex_polygon(m(pts), col, Stroke::NONE));
     };
-    // The faces are separated by gaps that show the application bar, not by white lines.
     let [light, mid, dark] = colours;
-    let edge_col = solidcraft_theme::Tokens::get().app_bar;
-    face(light, &[(3.5, 105.9), (177.0, 5.8), (263.4, 55.6), (263.8, 156.0), (177.0, 406.4)]);
-    face(light, &[(177.0, 206.1), (263.8, 156.0), (350.5, 206.2), (350.5, 306.3), (177.0, 406.4)]);
-    face(mid, &[(3.5, 105.9), (177.0, 206.1), (177.0, 406.4)]);
-    face(mid, &[(3.5, 105.9), (3.5, 205.7), (90.3, 256.2), (177.0, 206.1)]);
-    face(mid, &[(177.0, 206.1), (90.3, 256.2), (90.0, 356.2), (177.0, 406.4)]);
-    face(dark, &[(264.1, 155.8), (177.0, 206.1), (177.0, 406.4), (263.8, 256.2)]);
-    face(dark, &[(263.8, 256.2), (350.5, 206.2), (350.5, 306.3), (177.0, 406.4)]);
-    face(dark, &[(177.0, 206.1), (177.0, 406.4), (350.5, 306.3)]);
-    face(dark, &[(263.8, 55.9), (263.8, 156.0), (177.1, 105.9)]);
-    if !edges {
-        return;
+    let top = if edges { light.gamma_multiply(0.8) } else { light };
+    // Slab: two sides and the top.
+    face(mid, &[(4.0, 62.0), (50.0, 86.0), (50.0, 97.0), (4.0, 73.0)]);
+    face(dark, &[(50.0, 86.0), (96.0, 62.0), (96.0, 73.0), (50.0, 97.0)]);
+    face(top, &[(4.0, 62.0), (50.0, 38.0), (96.0, 62.0), (50.0, 86.0)]);
+    if edges {
+        // The road: an S across the slab.
+        let road = [(66.0, 46.0), (54.0, 54.0), (62.0, 62.0), (48.0, 70.0), (54.0, 78.0), (50.0, 82.0)];
+        p.add(egui::Shape::line(m(&road), Stroke::new(8.0 * s, Color32::from_rgb(0x4a, 0x4f, 0x57))));
+        p.add(egui::Shape::line(m(&road), Stroke::new(1.2 * s, Color32::from_rgb(0xe8, 0xea, 0xee))));
     }
-    // The seams between the faces and around the mark, in the bar's colour, so they read as gaps.
-    let edge = Stroke::new(10.0 * s, edge_col);
-    let line = |pts: &[(f32, f32)]| {
-        p.add(egui::Shape::line(m(pts), edge));
-    };
-    line(&[(263.8, 55.9), (177.1, 105.9), (263.8, 156.0), (263.8, 256.2), (350.6, 206.1)]);
-    line(&[(5.0, 105.9), (178.5, 206.1), (178.5, 406.4)]);
-    line(&[(177.0, 206.1), (263.8, 156.0)]);
-    p.add(egui::Shape::closed_line(
-        m(&[
-            (178.5, 5.8),
-            (5.0, 105.9),
-            (5.0, 206.1),
-            (91.7, 256.2),
-            (91.7, 356.4),
-            (178.5, 406.4),
-            (352.0, 306.3),
-            (352.0, 206.1),
-            (265.2, 156.0),
-            (265.2, 55.9),
-        ]),
-        edge,
-    ));
+    // Tall tower (back) and shorter one (left).
+    face(light, &[(60.0, 2.0), (71.0, 8.0), (60.0, 14.0), (49.0, 8.0)]);
+    face(mid, &[(49.0, 8.0), (60.0, 14.0), (60.0, 52.0), (49.0, 46.0)]);
+    face(dark, &[(60.0, 14.0), (71.0, 8.0), (71.0, 46.0), (60.0, 52.0)]);
+    face(light, &[(34.0, 24.0), (43.0, 29.0), (34.0, 34.0), (25.0, 29.0)]);
+    face(mid, &[(25.0, 29.0), (34.0, 34.0), (34.0, 58.0), (25.0, 53.0)]);
+    face(dark, &[(34.0, 34.0), (43.0, 29.0), (43.0, 53.0), (34.0, 58.0)]);
 }
 
 /// [`Glyphs::cross`]: a cross filling `r`.
