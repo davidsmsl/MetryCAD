@@ -17,6 +17,7 @@ pub mod ai_connect;
 pub use solidcraft_ui_kit::app_bar;
 pub use solidcraft_ui_kit::blur;
 pub mod bom_panel;
+pub mod macro_recorder;
 pub mod broken_view_preview;
 pub mod browser;
 pub mod browser_canvas;
@@ -759,6 +760,8 @@ pub struct SolveApp {
     pub install_steps: Option<install::Steps>,
     /// Toolbar buttons the user pinned, removed or reordered.
     pub toolbar_custom: toolbar_custom::ToolbarCustom,
+    /// MetryCAD: macro recording, saved macros and their pinned buttons.
+    pub macro_rec: macro_recorder::MacroState,
     /// Named settings profiles (#6237).
     pub settings_profiles: settings_profiles::Profiles,
     /// Preferences kept between runs, and their window.
@@ -1120,6 +1123,7 @@ impl SolveApp {
             usage: usage_stats::UsageStats::new(None),
             install_steps: None,
             toolbar_custom: toolbar_custom::ToolbarCustom::default(),
+            macro_rec: macro_recorder::MacroState::default(),
             settings_profiles: settings_profiles::Profiles::default(),
             preferences: prefs::Prefs::default(),
             prefs_window: prefs::PrefsWindow::default(),
@@ -1721,6 +1725,7 @@ impl SolveApp {
             self.status = None;
         }
         let done = self.command_completed(id, r);
+        macro_recorder::record(self, id, params, done.is_ok());
         issue_report::ticket::step_params(self, id, params);
         if self.session.revision != revision {
             timeline::stop_playback(self);
@@ -2869,6 +2874,10 @@ impl SolveApp {
             self.view_windows.start_tool_panel(self.docs.current_tab());
             self.dialog = Some(d);
             return;
+        }
+        if matches!(id, "sketch.line3d" | "sketch.arc3d" | "sketch.spline3d" | "sketch.point3d") {
+            // MetryCAD: switch 3D Sketch on for the active sketch so these tools never start locked.
+            let _ = self.run("sketch.options", json!({"sketch_3d": true}));
         }
         if let Some(mut t) = tools::Tool::for_command(id) {
             t.classic = self.preferences.construction_line_classic;
@@ -4381,6 +4390,7 @@ impl SolveApp {
             panel_runtime::show_desktop_windows(self, ui.ctx());
         }
         drop(report_input);
+        macro_recorder::show(self, ui.ctx());
         // After everything else, on every page (the start page too, which returns early from
         // `cad_ui`): the window's edges resize it (#1381).
         if self.custom_titlebar && !self.native_resize_border {
