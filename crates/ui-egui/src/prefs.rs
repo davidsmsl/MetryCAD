@@ -1781,7 +1781,7 @@ preference_settings! {
     /// Colour vision mode (#778): `off`, `protan`, `deutan` or `tritan`.
     color_vision: solidcraft_theme::ColorVision = solidcraft_theme::ColorVision::Off, PAGE_APPEARANCE;
     /// Check for updates at start and once a day (docs/updates.md).
-    check_updates: bool = true, 0;
+    check_updates: bool = false, 0;
     /// Share anonymous usage statistics (docs/privacy.md, `usage_stats`): on unless the person,
     /// the environment or the organization turns them off. A build without the `usage-stats`
     /// feature keeps the value and does nothing with it.
