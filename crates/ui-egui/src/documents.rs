@@ -2319,7 +2319,7 @@ impl WindowTitle {
                 let name = solidcraft_ui_text::Locale::for_language(language).given_name(name);
                 format!("{name}{} — SolidCraft", if dirty { " *" } else { "" })
             }
-            None => "SolidCraft".into(),
+            None => "MetryCAD".into(),
         })
     }
 }
@@ -3035,8 +3035,10 @@ pub fn tabs(app: &mut SolveApp, ui: &mut egui::Ui, r: Rect, x0: f32, x1: f32) {
             }
             crate::app_bar::TabAction::Maximize => crate::titlebar::toggle_maximize(ui.ctx()),
             crate::app_bar::TabAction::New => {
+                // MetryCAD: the "+" opens a new design tab straight away. The start page
+                // stays reachable from the logo / File view.
                 if idle {
-                    app.home.show(app.session.revision);
+                    new_tab(app);
                 }
             }
             crate::app_bar::TabAction::RenameDone
@@ -3846,7 +3848,7 @@ mod tests {
     fn window_title_respects_home_and_embedded_hosts() {
         let mut a = app();
         a.home.open = true;
-        assert_eq!(title_commands(&mut a), ["SolidCraft"]);
+        assert_eq!(title_commands(&mut a), ["MetryCAD"]);
         assert!(title_commands(&mut a).is_empty());
         a.home.open = false;
         let name = a.session.doc.name.clone();
@@ -3869,7 +3871,7 @@ mod tests {
         a.home.open = true;
         assert!(title_commands(&mut a).is_empty(), "opening the start page does not close the design");
         close(&mut a, 0, true);
-        assert_eq!(title_commands(&mut a), ["SolidCraft"], "closing the last design leaves only the blank placeholder");
+        assert_eq!(title_commands(&mut a), ["MetryCAD"], "closing the last design leaves only the blank placeholder");
     }
 
     #[test]
@@ -3878,7 +3880,7 @@ mod tests {
         assert_eq!(title.update(Some("Plate"), false, "en").as_deref(), Some("Plate — SolidCraft"));
         assert!(title.update(Some("Plate"), false, "en").is_none());
         assert_eq!(title.update(Some("Plate"), true, "en").as_deref(), Some("Plate * — SolidCraft"));
-        assert_eq!(title.update(None, true, "en").as_deref(), Some("SolidCraft"));
+        assert_eq!(title.update(None, true, "en").as_deref(), Some("MetryCAD"));
         assert!(title.update(None, false, "fr").is_none());
     }
 

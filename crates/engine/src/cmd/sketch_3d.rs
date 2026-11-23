@@ -152,9 +152,10 @@ fn needs_3d(sk: &solidcraft_sketch::Sketch, cmd: &str) -> Result<()> {
 /// while a 3D sketch is being edited; otherwise the tools could only fail on their first click.
 fn in_sketch_3d(s: &Session) -> std::result::Result<(), String> {
     let id = sketch_store::active(s).ok_or("no sketch is being edited (Create Sketch or Edit Sketch first)")?;
+    // MetryCAD: any active sketch enables the 3D tools; the UI turns 3D Sketch on when one
+    // starts, so the buttons are no longer locked until the user finds that switch.
     match sketch_store::read(&s.doc, id) {
-        Ok(sk) if sk.view.three_d => Ok(()),
-        Ok(_) => Err("turn on 3D Sketch (sketch.options sketch_3d: true) to draw 3D curves".into()),
+        Ok(_) => Ok(()),
         Err(_) => Err("no sketch is being edited (Create Sketch or Edit Sketch first)".into()),
     }
 }
