@@ -267,7 +267,7 @@ pub fn app_bar(app: &mut SolveApp, ui: &mut egui::Ui) {
                 items: Some(&preview_layout),
                 quick_ids: &quick_ids,
                 mark: &|painter, at| solidcraft_look::glyphs::brand_mark(painter, at),
-                name: "SolidCraft",
+                name: "MetryCAD",
                 leading: (crate::library::available(app) && !app.home.open).then_some(vec2(app_bar::ITEM_HEIGHT, app_bar::ITEM_HEIGHT)),
                 home: app_bar::BarButton { id: "home", icon: "home", tip: app.tr("ui.start_page"), enabled: idle, narrow: false, wide_only: false },
                 file: app.tr("ui.file"),

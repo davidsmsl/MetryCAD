@@ -661,7 +661,7 @@ pub(crate) fn show_native_preview(app: &SolveApp, ctx: &Context) {
     let size = window.outline.size() / pixels_per_point;
     let ready = native_scale.is_some();
     let builder = egui::ViewportBuilder::default()
-        .with_title("SolidCraft")
+        .with_title("MetryCAD")
         .with_decorations(false)
         .with_resizable(false)
         .with_active(false)
