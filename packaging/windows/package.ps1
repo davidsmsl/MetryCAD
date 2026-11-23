@@ -126,7 +126,8 @@ foreach ($exe in 'solidcraft-cli.exe') {
 if ($Phase -ne 'package') {
   Remove-Item -Recurse -Force $Stage -ErrorAction SilentlyContinue
   New-Item -ItemType Directory -Force -Path $Stage | Out-Null
-  Copy-Item (Join-Path $Bin 'solidcraft.exe'), (Join-Path $Bin 'solidcraft-cli.exe') $Stage
+  Copy-Item (Join-Path $Bin 'solidcraft.exe') (Join-Path $Stage 'MetryCAD.exe')  # MetryCAD: the app ships under its own name
+  Copy-Item (Join-Path $Bin 'solidcraft-cli.exe') $Stage
   foreach ($f in 'LICENSE-MIT', 'LICENSE-APACHE', 'NOTICE', 'THIRD-PARTY-LICENSES.txt') { Copy-Item (Join-Path $Root $f) $Stage }
 }
 if ($Phase -eq 'stage') {
@@ -138,7 +139,7 @@ $Icon = if ($env:SOLIDCRAFT_ICONS) { Join-Path $env:SOLIDCRAFT_ICONS 'solidcraft
 if (-not (Test-Path $Icon)) { throw "Missing package icon: $Icon" }
 
 # ---- MSI ---------------------------------------------------------------------------------------
-$Msi = Join-Path $Dist "solidcraft-$Version-windows-$Arch.msi"
+$Msi = Join-Path $Dist "MetryCAD-$Version-windows-$Arch.msi"
 if (-not $PortableOnly) {
 Invoke-Native 'wix build' {
   wix build (Join-Path $Root 'assets/platforms/windows/solidcraft.wxs') -arch $Arch `
@@ -155,12 +156,12 @@ Remove-Item -Force -ErrorAction SilentlyContinue ([IO.Path]::ChangeExtension($Ms
 }
 
 # ---- portable zip ------------------------------------------------------------------------------
-$Portable = Join-Path $TargetDir "windows-package\solidcraft-$Version-windows-$Arch-portable"
+$Portable = Join-Path $TargetDir "windows-package\MetryCAD-$Version-windows-$Arch-portable"
 Remove-Item -Recurse -Force $Portable -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force -Path $Portable | Out-Null
 Copy-Item (Join-Path $Stage '*.exe') $Portable
 foreach ($f in 'README.md', 'LICENSE-MIT', 'LICENSE-APACHE', 'NOTICE', 'THIRD-PARTY-LICENSES.txt') { Copy-Item (Join-Path $Root $f) $Portable }
-$Zip = Join-Path $Dist "solidcraft-$Version-windows-$Arch-portable.zip"
+$Zip = Join-Path $Dist "MetryCAD-$Version-windows-$Arch-portable.zip"
 Remove-Item -Force $Zip -ErrorAction SilentlyContinue
 Compress-Archive -Path $Portable -DestinationPath $Zip
 
@@ -180,8 +181,8 @@ if (-not $PortableOnly) {
 # ---- the app as a plain download (x64) ---------------------------------------------------------
 $Outputs += if ($PortableOnly) { @($Zip) } else { @($Msi, $Zip) }
 if ($Arch -eq 'x64' -and -not $PortableOnly) {
-  $Exe = Join-Path $Dist "SolidCraft-$Version-windows-$Arch.exe"
-  Copy-Item (Join-Path $Stage 'solidcraft.exe') $Exe
+  $Exe = Join-Path $Dist "MetryCAD-$Version-windows-$Arch.exe"
+  Copy-Item (Join-Path $Stage 'MetryCAD.exe') $Exe
   $Outputs += $Exe
 }
 
