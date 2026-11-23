@@ -896,6 +896,8 @@ fn one_bit_has_full_contrast(t: &Tokens, id: &str, paper: Color32, ink: Color32)
 }
 
 const ORIGINAL_BUILTIN_IDS: &[&str] = &[
+    "metrycad-azul",
+    "metrycad-grafito",
     "gruvbox-dark",
     "gruvbox-light",
     "solidcraft-95",
